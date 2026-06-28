@@ -1,0 +1,114 @@
+route: sports_score_lookup
+version: "0.1.0"
+name: "Mock MLB Score Lookup Harness"
+goal: "Demonstrate harness-style routing, phases, permissions, validators, escalation, and trace logging"
+
+budgets:
+  reasoning_steps_max: 12
+  tool_calls_max: 8
+  patch_attempt_max: 0
+  retries_max: 3
+
+permissions:
+  required:
+    - inspect_query
+    - route_classify
+    - permission_check
+    - build_plan
+    - execute_tools
+    - lookup_team_matchups
+    - fetch_latest_box_score
+    - validate
+    - summarize
+    - llm_call
+  allow:
+    - inspect_query
+    - route_classify
+    - permission_check
+    - build_plan
+    - execute_tools
+    - lookup_team_matchups
+    - fetch_latest_box_score
+    - validate
+    - summarize
+    - llm_call
+  deny:
+    - network
+    - secret_access
+
+prompts:
+  inspect_query: |
+    You are a deterministic sports-intent parser.
+    Convert the user query into strict JSON with this schema:
+    {
+      "intent": "sports_score_lookup",
+      "teams_detected": ["canonical_team_name", ...],
+      "sport_hint": "mlb" | null,
+      "needs_final": true | false,
+      "wants_score": true | false,
+      "raw_query": "<original query>"
+    }
+    Rules:
+    - Normalize teams to canonical names when possible: rangers -> Texas Rangers, astros -> Houston Astros.
+    - If a team mention is missing, keep list empty rather than guessing.
+
+actors:
+  planner: "MockPlanner"
+  router: "ToolRouter"
+  tools:
+    lookup_team_matchups:
+      talks_to: "MockSportsIndexService"
+      description: "Returns completed Ranger vs Astros game candidates"
+    fetch_latest_box_score:
+      talks_to: "MockBoxScoreService"
+      description: "Returns final score for selected game"
+  validator: "MockRuleValidator"
+  tracer: "StructuredTraceLogger"
+
+phases:
+  - id: inspect_query
+    actor: planner
+    goal: "Extract intent, sport, teams, and missing constraints"
+  - id: route_classify
+    actor: planner
+    goal: "Select best route and confidence"
+  - id: permission_check
+    actor: router
+    goal: "Ensure required abilities are permitted and blocked tools are not needed"
+  - id: build_plan
+    actor: planner
+    goal: "Generate ordered simulated tool plan"
+  - id: execute_tools
+    actor: router
+    goal: "Run simulated tool calls in order"
+  - id: validate
+    actor: validator
+    goal: "Check evidence completeness and confidence"
+  - id: summarize
+    actor: planner
+    goal: "Emit final response and next action"
+
+validators:
+  - id: all_phases_traced
+    condition: "every phase should emit a trace event"
+  - id: route_selected
+    condition: "selected_route must be sports_score_lookup"
+  - id: evidence_present
+    condition: "tool evidence (game + score) must exist"
+  - id: next_step_visible
+    condition: "final step must include next_action"
+
+escalation:
+  on_fail:
+    max_attempts: 3
+    fallback:
+      - broaden_query
+      - ask_clarification
+      - stop_with_findings
+
+outputs:
+  include_trace: true
+  include_phase_decisions: true
+  include_next_action: true
+  changed_files_expected: []
+

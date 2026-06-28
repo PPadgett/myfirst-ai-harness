@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myfirst-ai-harness"
+version = "0.1.0"
+description = "Local LLM harness with control-plane routing for non-thinking and thinking workflows"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.116",
+  "uvicorn[standard]>=0.34",
+  "pydantic>=2.9",
+  "httpx>=0.28",
+  "PyYAML>=6.0",
+  "python-dateutil>=2.9"
+]
+
+[project.scripts]
+harnessd = "harness.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+packages = ["harness", "harness.adapters"]
+

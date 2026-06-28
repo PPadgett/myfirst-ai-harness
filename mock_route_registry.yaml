@@ -1,0 +1,321 @@
+routes:
+  # A small finite list of workflows the harness knows how to run.
+  - id: sports_score_lookup
+    manifest: mock_harness_route.yaml
+    title: "Sports score lookup"
+    description: >
+      Resolve a sports intent by finding the latest completed matchup and returning
+      the final score.
+    intents:
+      - "sports score"
+      - "lookup game result"
+      - "final score"
+      - "who won"
+      - "game score"
+    phrase_terms:
+      - "final score"
+      - "who won"
+      - "lookup the"
+      - "lookup"
+      - "score for"
+      - "matchup"
+    intent_terms:
+      - "score"
+      - "final"
+      - "result"
+      - "game"
+      - "match"
+      - "who"
+      - "won"
+    entity_terms:
+      - "rangers"
+      - "astros"
+      - "mlb"
+      - "baseball"
+      - "team"
+      - "teams"
+      - "game"
+    required_bundles:
+      - ["score"]
+      - ["rangers", "astros"]
+      - ["mlb", "baseball"]
+    optional_terms:
+      - "latest"
+      - "recent"
+      - "final"
+    negative_terms:
+      - "error"
+      - "bug"
+      - "fix"
+      - "compile"
+      - "schedule"
+    examples:
+      - "Lookup the final MLB score for when the rangers played the astros"
+      - "Who won the Rangers Astros game"
+      - "What was the final score of the last Rangers game"
+    required_tools:
+      - "lookup_team_matchups"
+      - "fetch_latest_box_score"
+    required_slots:
+      - "team_a"
+      - "team_b"
+      - "is_final"
+    confidence_base: 0.58
+
+  - id: bug_repair
+    manifest: mock_harness_route.yaml
+    title: "Bug repair"
+    description: >
+      Fix a reported failure by inspecting the issue, producing a patch plan,
+      editing or simulating edits, and re-running tests.
+    intents:
+      - "bug fix"
+      - "repair code"
+      - "debug"
+      - "fix failure"
+      - "patch"
+    phrase_terms:
+      - "fix this"
+      - "fix the"
+      - "bug"
+      - "failing test"
+      - "debug"
+      - "traceback"
+    intent_terms:
+      - "bug"
+      - "fix"
+      - "repair"
+      - "error"
+      - "failure"
+      - "failing"
+      - "traceback"
+      - "pytest"
+    entity_terms:
+      - "error"
+      - "exception"
+      - "file"
+      - "stack"
+      - "tests"
+      - "assert"
+      - "patch"
+    required_bundles:
+      - ["bug"]
+      - ["error"]
+      - ["fix", "code"]
+    optional_terms:
+      - "test"
+      - "pytest"
+      - "stack"
+    negative_terms:
+      - "schedule"
+      - "meeting"
+      - "calendar"
+      - "invoice"
+    examples:
+      - "Please fix the bug and rerun failing tests"
+      - "There is a traceback in the build output"
+      - "Repair this code path and validate"
+    required_tools:
+      - "analyze_trace"
+      - "edit_file"
+      - "run_tests"
+    required_slots:
+      - "failure_context"
+      - "expected_outcome"
+    confidence_base: 0.55
+
+  - id: run_tests
+    manifest: mock_harness_route.yaml
+    title: "Run tests"
+    description: >
+      Execute focused tests first, then broader tests, then return a concise status.
+    intents:
+      - "run tests"
+      - "execute tests"
+      - "check tests"
+    phrase_terms:
+      - "run tests"
+      - "execute tests"
+      - "run the tests"
+      - "pytest"
+      - "run test suite"
+    intent_terms:
+      - "test"
+      - "tests"
+      - "pytest"
+      - "suite"
+      - "run"
+      - "execute"
+    entity_terms:
+      - "pytest"
+      - "integration"
+      - "unit"
+      - "suite"
+      - "coverage"
+    required_bundles:
+      - ["run", "tests"]
+      - ["pytest"]
+    optional_terms:
+      - "focus"
+      - "broader"
+      - "smoke"
+    negative_terms:
+      - "email"
+      - "score"
+      - "rangers"
+    examples:
+      - "Run focused tests and then run broader tests"
+      - "Execute the full test suite"
+      - "Run pytest for the project"
+    required_tools:
+      - "run_tests_tool"
+    required_slots:
+      - "test_scope"
+    confidence_base: 0.56
+
+  - id: summarize_doc
+    manifest: mock_harness_route.yaml
+    title: "Summarize document"
+    description: >
+      Condense user-provided text or a named document into a short summary.
+    intents:
+      - "summarize"
+      - "shorten"
+      - "brief summary"
+    phrase_terms:
+      - "summarize this"
+      - "summary"
+      - "briefly explain"
+      - "tl;dr"
+    intent_terms:
+      - "summarize"
+      - "summary"
+      - "brief"
+      - "condense"
+      - "short"
+      - "digest"
+    entity_terms:
+      - "document"
+      - "notes"
+      - "report"
+      - "text"
+      - "paragraph"
+    required_bundles:
+      - ["summarize"]
+      - ["summary"]
+    optional_terms:
+      - "brief"
+      - "highlights"
+    negative_terms:
+      - "bug"
+      - "score"
+      - "patch"
+    examples:
+      - "Give me a brief summary of this doc"
+      - "Summarize the notes from the meeting"
+      - "TL;DR the technical RFC"
+    required_tools:
+      - "summarizer"
+    required_slots:
+      - "source_text"
+    confidence_base: 0.53
+
+  - id: schedule_email
+    manifest: mock_harness_route.yaml
+    title: "Email drafting / scheduling"
+    description: >
+      Draft and optionally schedule an outbound message.
+    intents:
+      - "send email"
+      - "schedule email"
+      - "draft message"
+      - "email update"
+    phrase_terms:
+      - "send an email"
+      - "draft email"
+      - "email this"
+      - "schedule email"
+      - "email to"
+    intent_terms:
+      - "email"
+      - "send"
+      - "schedule"
+      - "invite"
+      - "draft"
+      - "recipient"
+    entity_terms:
+      - "recipient"
+      - "subject"
+      - "meeting"
+      - "calendar"
+      - "message"
+    required_bundles:
+      - ["email"]
+      - ["send", "email"]
+    optional_terms:
+      - "calendar"
+      - "subject"
+      - "draft"
+    negative_terms:
+      - "traceback"
+      - "test"
+      - "rangers"
+    examples:
+      - "Draft an email update and send to the team"
+      - "Schedule a follow-up meeting invite"
+      - "Email the customer a status update"
+    required_tools:
+      - "draft_email"
+      - "send_email"
+    required_slots:
+      - "recipient"
+      - "subject"
+      - "message"
+    confidence_base: 0.54
+
+  # Fallback route can still exist in the manifest as an explicit option.
+  - id: ask_clarification
+    manifest: mock_harness_route.yaml
+    title: "Ask clarification"
+    description: >
+      Ask the user for missing constraints when the request is too ambiguous.
+    intents:
+      - "clarification"
+      - "i'm not sure"
+    phrase_terms:
+      - "not sure"
+      - "unclear"
+      - "need more info"
+    intent_terms:
+      - "clarify"
+      - "clarification"
+    required_bundles: []
+    optional_terms: []
+    negative_terms: []
+    examples:
+      - "Can you clarify the target?"
+    required_tools: []
+    required_slots: []
+    confidence_base: 0.2
+
+router:
+  # How many routes enter recall and ranking stages.
+  candidate_top_k: 4
+  # Candidate recall threshold: keep routes with score >= max*ratio.
+  candidate_threshold_ratio: 0.3
+  # Combined score weights.
+  heuristic_weight: 0.62
+  semantic_weight: 0.31
+  # Direct classification confidence needed to skip fallback.
+  direct_confidence_min: 0.58
+  # Ambiguity rule when top-two margin is too narrow.
+  ambiguity_margin: 0.10
+  # Score below this goes straight to ask_clarification.
+  ask_clarification_max: 0.22
+  # Score above this but ambiguous sends to meta_route.
+  meta_route_min: 0.22
+  # Use this small model step when heuristic+semantic is uncertain.
+  use_mock_llm_fallback: true
+  # N-grams used for semantic fallback vector.
+  semantic_ngram_n: 3
+

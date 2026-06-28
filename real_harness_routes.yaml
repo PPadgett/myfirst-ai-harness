@@ -1,0 +1,358 @@
+version: "2.4.0"
+name: real-ai-harness
+
+description: |
+  Generic phase-based harness with finite workflow routes.
+  The router is topic-agnostic and route-driven; no domain-specific
+  dictionaries or sports fixtures are embedded in the manifest.
+
+budgets:
+  reasoning_steps_max: 18
+  tool_calls_max: 12
+  patch_attempt_max: 0
+  retries_max: 2
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+  timeout_seconds: 30
+  temperature: 0.0
+  max_tokens: 700
+  use_response_json: true
+  enable_router_llm_fallback: true
+  enable_query_inspect_llm: true
+  enable_slot_llm: true
+  enable_summary_llm: true
+
+router:
+  candidate_top_k: 10
+  semantic_ngram_n: 3
+  heuristic_weight: 0.58
+  semantic_weight: 0.34
+  direct_confidence_min: 0.52
+  ambiguity_margin: 0.10
+  ask_clarification_threshold: 0.18
+  meta_route_min: 0.24
+
+permissions:
+  allow_default:
+    - inspect_query
+    - route_classify
+    - permission_check
+    - extract_slots
+    - build_plan
+    - execute_tools
+    - summarize
+    - validate
+    - read_file
+    - write_file
+    - run_command
+    - network
+    - llm_call
+  deny_default:
+    - secret_access
+    - shell_unsafe
+
+routes:
+  - id: llm_answer
+    title: General reasoning and knowledge response
+    is_universal_fallback: true
+    description: >
+      Answer arbitrary user questions, clarifications, comparisons,
+      analysis prompts, and general-fact queries in the same language.
+      Use this as the default route when the query is informational.
+    phrase_terms:
+      - explain
+      - what is
+      - what are
+      - who is
+      - how to
+      - why
+      - compare
+      - meaning
+      - summary of
+    intent_terms:
+      - explain
+      - what
+      - who
+      - why
+      - compare
+      - define
+      - clarify
+      - describe
+      - analyze
+      - evaluate
+    optional_terms:
+      - details
+      - examples
+      - concise
+      - brief
+      - translate
+    required_permissions:
+      - llm_call
+    required_slots:
+      question:
+        required: true
+      language_guess:
+        required: false
+    prompts:
+      slot_extractor: |
+        Return strict JSON only.
+        Keys: question, language_guess.
+        question should contain the full request text.
+      summarizer: |
+        Return strict JSON with one key: summary.
+        Answer directly and accurately. Use same language as language_hint.
+
+  - id: summarize_doc
+    title: Document or text summarization
+    description: |
+      Summarize user-provided text, pasted text, notes, or brief documents.
+    phrase_terms:
+      - summarize
+      - summary
+      - tl;dr
+      - digest
+      - in short
+      - short version
+    intent_terms:
+      - summarize
+      - summary
+      - gist
+      - shorten
+      - extract
+    required_permissions:
+      - llm_call
+    required_slots:
+      source_text:
+        required: true
+      target_length:
+        required: false
+    prompts:
+      slot_extractor: |
+        Return strict JSON only with keys source_text and target_length.
+        target_length: short|normal|long.
+      summarizer: |
+        Return strict JSON with one key: summary.
+        Keep summary objective and concise. Do not invent missing details.
+
+  - id: package_payload
+    title: Build package payload
+    description: >
+      Build a package payload from user requirements.
+      Capture package metadata, dependencies, scripts, entry points, and file list.
+      Use this route when the user asks to create a package manifest/payload.
+    phrase_terms:
+      - build package
+      - package payload
+      - create package
+      - generate package manifest
+      - package manifest
+      - scaffold package
+      - package metadata
+      - create package payload
+    intent_terms:
+      - package
+      - payload
+      - manifest
+      - scaffold
+      - dependency
+      - dependencies
+      - entry point
+      - scripts
+    optional_terms:
+      - version
+      - files
+      - tests
+      - pyproject
+      - setup
+    required_bundles:
+      - [build, package]
+      - [create, payload]
+      - [package, manifest]
+    required_permissions:
+      - llm_call
+    required_slots:
+      package_name:
+        required: true
+      version:
+        required: false
+      description:
+        required: false
+      dependencies:
+        required: false
+      scripts:
+        required: false
+      entry_points:
+        required: false
+      files:
+        required: false
+      tests:
+        required: false
+    prompts:
+      slot_extractor: |
+        Return strict JSON only.
+        Keys: package_name, version, description, dependencies, scripts, entry_points, files, tests.
+        version should be string. If missing, return null.
+      summarizer: |
+        Return strict JSON with one key: summary.
+        summary must be a JSON object with key package_payload.
+        Keep this exact object shape:
+        {
+          "package_payload": {
+            "name": "<package_name>",
+            "version": "<version or 0.1.0>",
+            "description": "<description>",
+            "dependencies": [...],
+            "scripts": [...],
+            "entry_points": {...},
+            "files": [...],
+            "tests": [...]
+          }
+        }
+        Use sane defaults when fields are missing.
+
+  - id: run_tests
+    title: Execute tests
+    description: |
+      Run targeted pytest command(s) from a given scope and report pass/fail.
+    phrase_terms:
+      - run tests
+      - run test
+      - execute tests
+      - test suite
+      - pytest
+      - failing tests
+    intent_terms:
+      - test
+      - tests
+      - pytest
+      - failing
+      - execute
+      - run
+    required_bundles:
+      - [run, tests]
+      - [pytest]
+    required_permissions:
+      - run_command
+      - read_file
+    required_slots:
+      scope:
+        required: false
+    tools:
+      - run_tests
+    prompts:
+      slot_extractor: |
+        Return strict JSON only with one key: scope.
+        If the user mentioned file/function/module, set scope exactly.
+        If no explicit scope, return null.
+      summarizer: |
+        Return strict JSON with one key: summary.
+        Report pass/fail and top blocker in one sentence.
+
+  - id: bug_repair
+    title: Bug analysis and repair planning
+    description: |
+      Analyze error text or test failures and propose a concrete repair plan.
+    phrase_terms:
+      - bug
+      - traceback
+      - exception
+      - error
+      - failing
+      - crash
+      - fix
+      - repair
+    intent_terms:
+      - bug
+      - traceback
+      - exception
+      - failing
+      - stack
+      - error
+      - patch
+    required_bundles:
+      - [bug, fix]
+      - [traceback]
+    required_permissions:
+      - llm_call
+      - read_file
+    required_slots:
+      bug_text:
+        required: true
+    prompts:
+      slot_extractor: |
+        Return strict JSON only with key bug_text.
+        If stack trace exists include the most relevant context.
+      summarizer: |
+        Return strict JSON with key summary.
+        Start with likely root cause, then provide 2-4 concrete actions.
+
+  - id: schedule_email
+    title: Email draft and scheduling request
+    description: |
+      Draft email content or reminder text. Requires explicit recipient and content
+      confirmation before action.
+    phrase_terms:
+      - send email
+      - schedule email
+      - draft email
+      - notify
+      - reminder
+    intent_terms:
+      - email
+      - send
+      - schedule
+      - notify
+      - reminder
+      - draft
+    required_bundles:
+      - [send, email]
+      - [schedule, email]
+    required_permissions:
+      - email_send
+    required_slots:
+      to:
+        required: false
+      subject:
+        required: false
+      body:
+        required: false
+    prompts:
+      slot_extractor: |
+        Return strict JSON only with keys to, subject, body.
+        Set any missing field to null.
+      summarizer: |
+        Return strict JSON with one key: summary.
+        Ask for missing required fields before executing.
+
+  - id: ask_clarification
+    title: Ask for missing details
+    description: |
+      Ask concise clarification questions when confidence is too low or required
+      fields are missing.
+    required_permissions: []
+    required_slots: {}
+    tools: []
+
+  - id: meta_route
+    title: Temporary plan creation and validation
+    description: |
+      If no route is sufficiently confident, create a temporary plan candidate,
+      then validate before execution.
+    required_permissions:
+      - llm_call
+    required_slots:
+      temporary_plan:
+        required: false
+      reason:
+        required: false
+    tools: []
+
+  - id: fallback_unknown
+    title: Generic fallback
+    description: |
+      Final fallback for unsupported or unresolved routing outcomes.
+    required_permissions: []
+    required_slots: {}
+    tools: []

@@ -1,0 +1,96 @@
+Local AI Harness — Part documentation index
+===========================================
+
+This repository is organized into harness components that can be operated independently:
+
+- `harness/` runtime layer
+- `harness/adapters/` model transport layer
+- `deployment/` containerized local execution and ops
+- Root config and entrypoint files (`harness.yaml`, `docker-compose.nvidia.yaml`, env templates)
+
+Step-level docs (new):
+- [docs/core-pipeline-and-policy-control.md](/docs/core-pipeline-and-policy-control.md)
+- [docs/local-model-backend-abstraction.md](/docs/local-model-backend-abstraction.md)
+- [docs/tooling-validation-safety-traces.md](/docs/tooling-validation-safety-traces.md)
+- [docs/api-surface-and-launch.md](/docs/api-surface-and-launch.md)
+
+If you want clear part-by-part ownership, read:
+
+- [harness/readme.me](/harness/readme.me)
+- [harness/adapters/readme.me](/harness/adapters/readme.me)
+- [deployment/readme.me](/deployment/readme.me)
+
+Core path overview
+------------------
+
+1. `harness.py` entrypoint imports `harness/server.py`.
+2. `server.py` loads `load_runtime_config()` from `harness/config.py`.
+3. Backend client is selected from:
+   - `llamacpp`
+   - `nvidia_nim`
+   - `ollama` (via OpenAI-compatible API)
+   - `openai` compatibility and `auto` fallback
+4. Incoming request hits:
+   - `/v1/chat/completions`
+   - `/v1/answer`
+5. `harness/runtime.py` executes:
+   - route classification (`harness/router.py`)
+   - guard checks (`harness/guards.py`)
+   - optional retrieval (`harness/retrieval.py`)
+   - optional tool calls (`harness/tools.py`)
+   - model call via adapter
+   - schema repair/validation (`harness/validation.py`)
+   - cache/trace writes (`harness/trace_cache.py`)
+
+How to think about “parts”
+--------------------------
+
+- **Control plane**  
+  `server.py` and `cli.py`: API contract, request normalization, startup checks.
+
+- **Policy plane**  
+  `router.py`, `guards.py`, `validation.py`: routing, safety policy, and schema validation.
+
+- **Execution plane**  
+  `runtime.py`: orchestrates one request from input to final response artifact.
+
+- **Knowledge plane**  
+  `retrieval.py`: local corpus loading + ranking + context packaging.
+
+- **Tool plane**  
+  `tools.py`: secure function/tool contracts (`calculator`, `time_now`, `new_uuid`).
+
+- **Data plane**  
+  `trace_cache.py`: response cache and trace persistence.
+
+- **Model plane**  
+  `adapters/*`: provider-specific client behavior and authentication.
+
+- **Ops plane**  
+  `Dockerfile`, `docker-compose.nvidia.yaml`, `.env.*.example`, deployment readme.
+
+Cutting-edge upgrade checklist (next capabilities to add)
+--------------------------------------------------------
+
+- Add an enterprise policy engine:
+  - OPA/Rego or Cedar policies for dynamic allow/deny decisions.
+- Replace lexical route heuristics with a small classifier model and/or `transformers` pipeline.
+- Introduce a vector retrieval stack:
+  - sentence-transformer embeddings
+  - Milvus/Qdrant/pgvector
+  - cross-encoder rerank.
+- Add first-class async streaming responses (SSE/WebSocket).
+- Add structured tracing and span-level observability (OpenTelemetry + Jaeger).
+- Add PII detection and redaction before tool use and logging.
+- Add strict JSON schema enforcement (`jsonschema`/Pydantic) with retry policy and backoff.
+- Add rate-limits, authN/Z, and request quotas per key/workspace.
+- Add model routing/multi-armed-bandit failover across providers.
+- Add eval harness with golden tests and regression scoring for route quality, safety, and latency.
+
+Windows 11 note
+---------------
+
+The deployment docs in [deployment/readme.me](/deployment/readme.me) include PowerShell commands for:
+- NVIDIA NIM profile
+- Ollama profile
+- health/readiness workflows

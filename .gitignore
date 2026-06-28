@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+traces/
+.cache/
+*.egg-info/
+.env.nvidia
+.env.ollama
+.nim-cache/
+.ollama/

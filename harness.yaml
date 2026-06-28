@@ -1,0 +1,28 @@
+backend:
+  name: openai
+  base_url: "http://127.0.0.1:11434/v1"
+  api_key: null
+  timeout_seconds: 120
+  max_tokens: 768
+  extra_headers: {}
+  extra_body: {}
+
+model: "qwen2.5:7b"
+corpus_dir: "corpus"
+trace_dir: "traces"
+cache_dir: ".cache"
+enable_cache: true
+max_cache_entries: 2000
+
+tool_allowlist:
+  - "calculator"
+  - "time_now"
+  - "new_uuid"
+
+# NVIDIA NIM example (set backend: nvidia_nim and point base_url to your local NIM container)
+# backend:
+#   name: nvidia_nim
+#   base_url: "http://127.0.0.1:8000/v1"
+#   api_key: null
+#   timeout_seconds: 120
+#   max_tokens: 1536

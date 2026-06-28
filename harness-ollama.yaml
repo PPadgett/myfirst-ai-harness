@@ -1,0 +1,20 @@
+backend:
+  name: ollama
+  base_url: "http://ollama:11434/v1"
+  api_key: null
+  timeout_seconds: 120
+  max_tokens: 768
+  extra_headers: {}
+  extra_body: {}
+
+model: "llama3:8b"
+corpus_dir: "corpus"
+trace_dir: "traces"
+cache_dir: ".cache"
+enable_cache: true
+max_cache_entries: 4000
+
+tool_allowlist:
+  - "calculator"
+  - "time_now"
+  - "new_uuid"

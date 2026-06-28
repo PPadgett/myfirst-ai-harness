@@ -1,0 +1,19 @@
+backend:
+  name: nvidia_nim
+  base_url: "http://nvidia-nim:8000/v1"
+  api_key: null
+  timeout_seconds: 120
+  max_tokens: 1536
+  extra_headers: {}
+  extra_body: {}
+
+model: "hf://meta-llama/Llama-3.1-8B-Instruct"
+corpus_dir: "corpus"
+trace_dir: "traces"
+cache_dir: ".cache"
+enable_cache: true
+max_cache_entries: 4000
+tool_allowlist:
+  - "calculator"
+  - "time_now"
+  - "new_uuid"

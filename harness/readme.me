@@ -1,0 +1,107 @@
+Harness Core Part
+================
+
+This folder contains the control and orchestration parts that implement the harness runtime.
+
+What it does
+------------
+
+The core of the harness is a policy-aware request pipeline:
+
+1. Accept HTTP requests on OpenAI-compatible routes.
+2. Classify intent and policy route.
+3. Optionally run safety guards.
+4. Optionally retrieve context from corpus.
+5. Optionally plan and execute tools.
+6. Call the selected LLM backend adapter.
+7. Validate schema, enforce safety, write trace/cache artifacts, and return response.
+
+Primary files
+-------------
+
+- `server.py`
+  - FastAPI app factory.
+  - Backend resolution (llamacpp / nvidia_nim / ollama / openai / auto).
+  - Startup readiness check against provider model catalog.
+  - `/health` and request endpoints.
+
+- `cli.py`
+  - Entry point used by `harnessd` command.
+
+- `config.py`
+  - Loads YAML config + env fallbacks.
+  - Backend alias resolution (`nvidia`, `nim`, `nvidia-nim` -> `nvidia_nim`).
+  - API key/env resolution and backend-specific validation.
+
+- `runtime.py`
+  - The central execution orchestrator.
+  - Produces request tracing data.
+  - Handles route policy, retrieval, tools, model calls, parse/repair, and response assembly.
+
+- `router.py`
+  - Heuristic route classifier.
+  - Produces `RoutePolicy` controls (retrieval/tools/strict_schema/etc.).
+
+- `guards.py`
+  - Input/output guardrails and block reasons.
+
+- `retrieval.py`
+  - Corpus ingestion and simplistic retrieval with reranking.
+
+- `tools.py`
+  - Tool spec schema + execution surface.
+
+- `validation.py`
+  - JSON extraction and schema checks for structured output.
+
+- `trace_cache.py`
+  - Trace logging and response cache on disk.
+
+- `types.py`
+  - Shared request/result dataclasses for the runtime/adapters boundary.
+
+How it works (request path)
+---------------------------
+
+- `server` receives JSON payload.
+- `RuntimeConfig` resolves backend and runtime settings.
+- `route = classify_route(...)` sets execution controls.
+- Input guard check runs before expensive operations.
+- If needed, retrieval obtains evidence snippets.
+- If needed, tool planning call asks model to propose `tool_calls`.
+- Tools execute locally and their output is injected into model prompt context.
+- Final completion call is generated.
+- If schema required, parse/validate; if malformed, repair path triggers second generation attempt.
+- Response is cached (optional), traced to disk, and returned as OpenAI-like JSON.
+
+Cutting-edge enhancements for this part
+--------------------------------------
+
+- Replace heuristic routing with:
+  - learned routing model
+  - confidence scores
+  - fallback to high-trust path on ambiguity.
+- Add stateful memory (conversation summaries + memory store per user/session).
+- Add policy DSL from externalized rules engine (instead of hardcoded route patterns).
+- Add deterministic tool planning with:
+  - explicit verifier for tool arguments
+  - structured tool-result schema normalization.
+- Add request dedupe and idempotency keys.
+- Add policy-injected prompt templates with versioned prompt packages.
+- Add structured metrics per route/decision (p95 latency, schema failure rate, tool success).
+
+Implementation guidance
+----------------------
+
+- Keep each part in `runtime` independent and stateless where possible.
+- Add unit/integration tests for route transitions and response invariants before changing guard or tool logic.
+- Prefer small interface changes:
+  - add optional policy fields to `RoutePolicy`
+  - keep adapter interface stable (`generate` + request/response models).
+
+Related docs
+------------
+
+- [harness/adapters/readme.me](/harness/adapters/readme.me)
+- [deployment/readme.me](/deployment/readme.me)
+- [README.md](/README.md)

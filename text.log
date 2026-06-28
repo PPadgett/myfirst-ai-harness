@@ -1,0 +1,1830 @@
+[2026-06-28T03:32:44.627142+00:00] phase=bootstrap step=bootstrap.init_state actor=HarnessRuntime
+  action: initialize run state and trace container
+  input : {"manifest_path": "mock_harness_route.yaml"}
+  output: {"attempt": 1}
+  next  : bootstrap.load_manifest_path
+  why   : Everything starts with local runtime state and output tracing setup.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.627342+00:00] phase=bootstrap step=bootstrap.validate_manifest_path actor=HarnessRuntime
+  action: check manifest file exists
+  input : {"manifest_path": "mock_harness_route.yaml"}
+  output: {"exists": true}
+  next  : bootstrap.read_manifest
+  why   : The loader must prove the manifest path is valid before parse.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.627405+00:00] phase=bootstrap step=bootstrap.read_manifest actor=HarnessRuntime
+  action: read manifest file bytes
+  input : {"manifest_path": "mock_harness_route.yaml"}
+  output: {"file_size_bytes": 3020}
+  next  : bootstrap.parse_manifest_yaml
+  why   : File read happens before YAML parsing and validation.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.628386+00:00] phase=bootstrap step=bootstrap.parse_manifest_yaml actor=HarnessRuntime
+  action: parse YAML payload
+  input : {"manifest_path": "mock_harness_route.yaml"}
+  output: {"raw_preview": "route: sports_score_lookup\nversion: \"0.1.0\"\nname: \"Mock MLB Score Lookup Harness\"\ngoal: \"Demonstrate harness-style routi"}
+  next  : bootstrap.normalize_manifest
+  why   : The YAML text is converted to native data structures.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.633732+00:00] phase=bootstrap step=bootstrap.normalize_manifest actor=HarnessRuntime
+  action: validate manifest structure
+  input : {"is_mapping": true}
+  output: {"manifest_route": "sports_score_lookup"}
+  next  : bootstrap.manifest_loaded
+  why   : Normalization guarantees downstream readers can safely index manifest fields.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.633815+00:00] phase=bootstrap step=bootstrap.manifest_loaded actor=HarnessRuntime
+  action: manifest loaded and normalized
+  input : {"manifest_path": "mock_harness_route.yaml"}
+  output: {"manifest_keys": ["actors", "budgets", "escalation", "goal", "name", "outputs", "permissions", "phases", "prompts", "route", "validators", "version"]}
+  next  : bootstrap.load_budgets
+  why   : Manifest keys are now known; routing and validation can begin.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.633848+00:00] phase=bootstrap step=bootstrap.budgets_ready actor=HarnessRuntime
+  action: set runtime budgets from manifest
+  input : {"manifest_budgets": {"patch_attempt_max": 0, "reasoning_steps_max": 12, "retries_max": 3, "tool_calls_max": 8}}
+  output: {"budgets": {"patch_attempt_max": 0, "reasoning_steps_max": 12, "retries_max": 3, "tool_calls_max": 8}}
+  next  : bootstrap.load_route_catalog
+  why   : Tool-call/attempt limits are fixed before route scoring.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.633892+00:00] phase=bootstrap step=bootstrap.route_catalog_ready actor=PolicyRouter
+  action: prepare route catalog for scoring stage
+  input : {"catalog_size": 4}
+  output: {"route_ids": ["sports_score_lookup", "ask_clarification", "meta_route", "fallback_unknown"]}
+  next  : main.parse_request
+  why   : Routes are ready before the first main phase runs.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.633918+00:00] phase=main step=main.receive_inputs actor=CLIAdapter
+  action: capture incoming arguments
+  input : {"manifest_path": "mock_harness_route.yaml", "query": "Lookup the final score for Rangers vs Astros"}
+  output: {"query_len": 44}
+  next  : main.parse_request
+  why   : The first real action is receiving and validating caller inputs.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.633939+00:00] phase=main step=main.parse_request actor=HarnessRuntime
+  action: start mock harness
+  input : {"manifest_path": "mock_harness_route.yaml", "query": "Lookup the final score for Rangers vs Astros"}
+  output: {"attempt": 1}
+  next  : inspect_query
+  why   : Every run begins in the inspect_query phase.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.633964+00:00] phase=inspect_query step=inspect_query.read_raw_query actor=InputReader
+  action: capture raw user query
+  input : {"query_from_cli": "Lookup the final score for Rangers vs Astros"}
+  output: {"raw_query": "Lookup the final score for Rangers vs Astros"}
+  next  : inspect_query.normalize
+  why   : Every run starts by saving the exact user text.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634151+00:00] phase=inspect_query step=inspect_query.normalize_and_tokenize actor=InputNormalizer
+  action: normalize query text and generate tokens
+  input : {"raw_query": "Lookup the final score for Rangers vs Astros"}
+  output: {"normalized": "lookup the final score for rangers vs astros", "token_set": ["astros", "final", "for", "lookup", "rangers", "score", "the", "vs"], "tokens": ["lookup", "the", "final", "score", "for", "rangers", "vs", "astros"]}
+  next  : inspect_query.build_profile
+  why   : Lower/canonical tokens make deterministic matching stable.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634183+00:00] phase=inspect_query step=inspect_query.deterministic_profile actor=InputProfiler
+  action: build deterministic profile
+  input : {"normalized": "lookup the final score for rangers vs astros", "tokens": ["lookup", "the", "final", "score", "for", "rangers", "vs", "astros"]}
+  output: {"has_final_term": true, "has_score_term": true, "has_team_hints": true, "language_hint": "en", "normalized_query": "lookup the final score for rangers vs astros", "query": "Lookup the final score for Rangers vs Astros", "query_length": 44, "raw_query": "Lookup the final score for Rangers vs Astros", "token_count": 8, "wants_final": true, "wants_output": true}
+  next  : inspect_query.llm_profile_check
+  why   : Deterministic profile is always available and never relies on LLM.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634215+00:00] phase=inspect_query step=inspect_query.llm_profile_enabled actor=PolicyRouter
+  action: check if inspect_query prompt exists
+  input : {"has_prompt": true}
+  output: {"enabled": true}
+  next  : inspect_query.structured_intent
+  why   : If no prompt is available, deterministic path only is used.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634238+00:00] phase=inspect_query step=inspect_query.structured_intent_json actor=MockLLM
+  action: parse intent JSON from query
+  input : {"model": "mock-llm", "prompt": "You are a deterministic sports-intent parser.\nConvert the user query into strict JSON with this schema:\n{\n  \"intent\": \"sports_score_lookup\",\n  \"teams_detected\": [\"canonical_team_name\", ...],\n  \"sport_hint\": \"mlb\" | null,\n  \"needs_final\": true | false,\n  \"wants_score\": true | false,\n  \"raw_query\": \"<original query>\"\n}\nRules:\n- Normalize teams to canonical names when possible: rangers -> Texas Rangers, astros -> Houston Astros.\n- If a team mention is missing, keep list empty rather than guessing.\n", "query": "Lookup the final score for Rangers vs Astros"}
+  output: {"confidence": 0.94, "intent": "sports_score_lookup", "language_hint": "en", "needs_final": true, "raw_query": "Lookup the final score for Rangers vs Astros", "sport_hint": "mlb", "teams_detected": ["Texas Rangers", "Houston Astros"], "wants_score": true}
+  next  : inspect_query.merge_profiles
+  why   : Mock structured parser returns route_hint, team hints, and confidence.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634603+00:00] phase=inspect_query step=inspect_query.merge_profiles actor=PolicyRouter
+  action: merge deterministic + LLM profile
+  input : {"deterministic": {"has_final_term": true, "has_score_term": true, "has_team_hints": true, "language_hint": "en", "normalized_query": "lookup the final score for rangers vs astros", "query": "Lookup the final score for Rangers vs Astros", "query_length": 44, "raw_query": "Lookup the final score for Rangers vs Astros", "token_count": 8, "wants_final": true, "wants_output": true}, "llm_profile": {"confidence": 0.94, "intent": "sports_score_lookup", "language_hint": "en", "needs_final": true, "raw_query": "Lookup the final score for Rangers vs Astros", "sport_hint": "mlb", "teams_detected": ["Texas Rangers", "Houston Astros"], "wants_score": true}}
+  output: {"has_final_term": true, "has_score_term": true, "has_team_hints": true, "language_hint": "en", "llm_confidence": 0.94, "llm_intent_hint": "sports_score_lookup", "normalized_query": "lookup the final score for rangers vs astros", "query": "Lookup the final score for Rangers vs Astros", "query_length": 44, "raw_query": "Lookup the final score for Rangers vs Astros", "team_a": "Texas Rangers", "team_b": "Houston Astros", "teams_detected": ["Texas Rangers", "Houston Astros"], "token_count": 8, "wants_final": true, "wants_output": true}
+  next  : route_classify
+  why   : This merged profile drives every downstream phase.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634735+00:00] phase=route_classify step=route_classify.heuristic_score actor=LayeredRouter
+  action: phrase + intent matching score
+  input : {"query": "lookup the final score for rangers vs astros", "route": "sports_score_lookup"}
+  output: {"heuristic_clamped": 1.0, "heuristic_raw": 1.5499999999999998}
+  next  : route_classify.semantic_score
+  why   : Phrase matches raise score; explicit negative terms lower score.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634824+00:00] phase=route_classify step=route_classify.semantic_score actor=LayeredRouter
+  action: semantic overlap (n-gram overlap stub)
+  input : {"route": "sports_score_lookup", "route_text": "sports score lookup return a final score result for team vs team lookup queries. sports_score_lookup"}
+  output: {"semantic_score": 0.2958}
+  next  : route_classify.combine_scores
+  why   : This is a deterministic approximation for teaching instead of a real embedding model.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634857+00:00] phase=route_classify step=route_classify.combined_score actor=LayeredRouter
+  action: combine candidate scores
+  input : {"heuristic": 1.0, "penalty": 0.0, "route": "sports_score_lookup", "semantic": 0.29577464788732394}
+  output: {"combined": 0.7535}
+  next  : route_classify.sort_top_k
+  why   : Combined score is one deterministic number used for ranking.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634907+00:00] phase=route_classify step=route_classify.heuristic_score actor=LayeredRouter
+  action: phrase + intent matching score
+  input : {"query": "lookup the final score for rangers vs astros", "route": "ask_clarification"}
+  output: {"heuristic_clamped": 0.0, "heuristic_raw": 0.0}
+  next  : route_classify.semantic_score
+  why   : Phrase matches raise score; explicit negative terms lower score.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634968+00:00] phase=route_classify step=route_classify.semantic_score actor=LayeredRouter
+  action: semantic overlap (n-gram overlap stub)
+  input : {"route": "ask_clarification", "route_text": "ask clarification collect missing information and stop before tool execution. ask_clarification"}
+  output: {"semantic_score": 0.0541}
+  next  : route_classify.combine_scores
+  why   : This is a deterministic approximation for teaching instead of a real embedding model.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.634994+00:00] phase=route_classify step=route_classify.combined_score actor=LayeredRouter
+  action: combine candidate scores
+  input : {"heuristic": 0.0, "penalty": 0.0, "route": "ask_clarification", "semantic": 0.05405405405405406}
+  output: {"combined": 0.0189}
+  next  : route_classify.sort_top_k
+  why   : Combined score is one deterministic number used for ranking.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635028+00:00] phase=route_classify step=route_classify.heuristic_score actor=LayeredRouter
+  action: phrase + intent matching score
+  input : {"query": "lookup the final score for rangers vs astros", "route": "meta_route"}
+  output: {"heuristic_clamped": 0.0, "heuristic_raw": 0.0}
+  next  : route_classify.semantic_score
+  why   : Phrase matches raise score; explicit negative terms lower score.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635077+00:00] phase=route_classify step=route_classify.semantic_score actor=LayeredRouter
+  action: semantic overlap (n-gram overlap stub)
+  input : {"route": "meta_route", "route_text": "temporary plan route generate temporary route plan and re-enter flow. meta_route"}
+  output: {"semantic_score": 0.0}
+  next  : route_classify.combine_scores
+  why   : This is a deterministic approximation for teaching instead of a real embedding model.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635096+00:00] phase=route_classify step=route_classify.combined_score actor=LayeredRouter
+  action: combine candidate scores
+  input : {"heuristic": 0.0, "penalty": 0.0, "route": "meta_route", "semantic": 0.0}
+  output: {"combined": 0.0}
+  next  : route_classify.sort_top_k
+  why   : Combined score is one deterministic number used for ranking.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635117+00:00] phase=route_classify step=route_classify.heuristic_score actor=LayeredRouter
+  action: phrase + intent matching score
+  input : {"query": "lookup the final score for rangers vs astros", "route": "fallback_unknown"}
+  output: {"heuristic_clamped": 0.0, "heuristic_raw": 0.0}
+  next  : route_classify.semantic_score
+  why   : Phrase matches raise score; explicit negative terms lower score.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635153+00:00] phase=route_classify step=route_classify.semantic_score actor=LayeredRouter
+  action: semantic overlap (n-gram overlap stub)
+  input : {"route": "fallback_unknown", "route_text": "generic fallback generic fallback when no route is a clean match. fallback_unknown"}
+  output: {"semantic_score": 0.0172}
+  next  : route_classify.combine_scores
+  why   : This is a deterministic approximation for teaching instead of a real embedding model.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635174+00:00] phase=route_classify step=route_classify.combined_score actor=LayeredRouter
+  action: combine candidate scores
+  input : {"heuristic": 0.0, "penalty": 0.1, "route": "fallback_unknown", "semantic": 0.017241379310344827}
+  output: {"combined": -0.094}
+  next  : route_classify.sort_top_k
+  why   : Combined score is one deterministic number used for ranking.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635193+00:00] phase=route_classify step=route_classify.iterate_and_score actor=LayeredRouter
+  action: compute candidate score for every route
+  input : {"route_count": 4}
+  output: [{"combined": 0.7535, "heuristic": 1.0, "route": {"description": "Return a final score result for team vs team lookup queries.", "id": "sports_score_lookup", "intent_terms": ["score", "final", "played", "mlb", "baseball", "game"], "negative_terms": ["deploy", "email", "password"], "phrase_terms": ["lookup", "final", "who", "won", "score", "result", "matchup"], "required_permissions": ["inspect_query", "route_classify", "permission_check", "build_plan", "execute_tools", "lookup_team_matchups", "fetch_latest_box_score", "validate", "summarize", "llm_call", "extract_slots"], "required_slots": ["team_a", "team_b"], "title": "sports score lookup", "tools": ["lookup_team_matchups", "fetch_latest_box_score"], "validator_required_fields": ["box_score", "score"]}, "route_id": "sports_score_lookup", "semantic": 0.29577464788732394, "title": "sports score lookup"}, {"combined": 0.0189, "heuristic": 0.0, "route": {"description": "Collect missing information and stop before tool execution.", "id": "ask_clarification", "required_permissions": [], "title": "ask clarification", "tools": [], "validator_required_fields": []}, "route_id": "ask_clarification", "semantic": 0.05405405405405406, "title": "ask clarification"}, {"combined": 0.0, "heuristic": 0.0, "route": {"description": "Generate temporary route plan and re-enter flow.", "id": "meta_route", "required_permissions": [], "title": "temporary plan route", "tools": [], "validator_required_fields": []}, "route_id": "meta_route", "semantic": 0.0, "title": "temporary plan route"}, {"combined": 0.0, "heuristic": 0.0, "route": {"description": "Generic fallback when no route is a clean match.", "id": "fallback_unknown", "required_permissions": [], "title": "generic fallback", "tools": [], "validator_required_fields": []}, "route_id": "fallback_unknown", "semantic": 0.017241379310344827, "title": "generic fallback"}]
+  next  : route_classify.top_k
+  why   : The route list is fully iterated to keep scoring deterministic and explainable.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635666+00:00] phase=route_classify step=route_classify.sort_top_k actor=LayeredRouter
+  action: sort by combined score and keep top-k
+  input : {"k": 3}
+  output: [{"combined": 0.7535, "heuristic": 1.0, "route": {"description": "Return a final score result for team vs team lookup queries.", "id": "sports_score_lookup", "intent_terms": ["score", "final", "played", "mlb", "baseball", "game"], "negative_terms": ["deploy", "email", "password"], "phrase_terms": ["lookup", "final", "who", "won", "score", "result", "matchup"], "required_permissions": ["inspect_query", "route_classify", "permission_check", "build_plan", "execute_tools", "lookup_team_matchups", "fetch_latest_box_score", "validate", "summarize", "llm_call", "extract_slots"], "required_slots": ["team_a", "team_b"], "title": "sports score lookup", "tools": ["lookup_team_matchups", "fetch_latest_box_score"], "validator_required_fields": ["box_score", "score"]}, "route_id": "sports_score_lookup", "semantic": 0.29577464788732394, "title": "sports score lookup"}, {"combined": 0.0189, "heuristic": 0.0, "route": {"description": "Collect missing information and stop before tool execution.", "id": "ask_clarification", "required_permissions": [], "title": "ask clarification", "tools": [], "validator_required_fields": []}, "route_id": "ask_clarification", "semantic": 0.05405405405405406, "title": "ask clarification"}, {"combined": 0.0, "heuristic": 0.0, "route": {"description": "Generate temporary route plan and re-enter flow.", "id": "meta_route", "required_permissions": [], "title": "temporary plan route", "tools": [], "validator_required_fields": []}, "route_id": "meta_route", "semantic": 0.0, "title": "temporary plan route"}]
+  next  : route_classify.ambiguity_check
+  why   : Top candidates are still available for rerank + fallback logic.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635771+00:00] phase=route_classify step=route_classify.ambiguity_check actor=LayeredRouter
+  action: check low-confidence + ambiguity
+  input : {"top1": 0.7535, "top2": 0.0189}
+  output: {"ambiguous": false, "low_confidence": false}
+  next  : route_classify.llm_rerank_or_accept
+  why   : Both low confidence and ambiguity gates are evaluated here.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635804+00:00] phase=route_classify step=route_classify.skip_llm_fallback actor=LayeredRouter
+  action: skip mock LLM rerank
+  input : {"ambiguous": false, "low_confidence": false}
+  output: {"chosen": "sports_score_lookup", "reason": "confidence route"}
+  next  : route_classify.apply_fallback
+  why   : LLM rerank is only called on weak/ambiguous scoring in this teaching path.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635832+00:00] phase=route_classify step=route_classify.apply_fallback actor=LayeredRouter
+  action: accept top candidate
+  input : {"candidate": "sports_score_lookup"}
+  output: {"combined": 0.7535, "heuristic": 1.0, "route": {"description": "Return a final score result for team vs team lookup queries.", "id": "sports_score_lookup", "intent_terms": ["score", "final", "played", "mlb", "baseball", "game"], "negative_terms": ["deploy", "email", "password"], "phrase_terms": ["lookup", "final", "who", "won", "score", "result", "matchup"], "required_permissions": ["inspect_query", "route_classify", "permission_check", "build_plan", "execute_tools", "lookup_team_matchups", "fetch_latest_box_score", "validate", "summarize", "llm_call", "extract_slots"], "required_slots": ["team_a", "team_b"], "title": "sports score lookup", "tools": ["lookup_team_matchups", "fetch_latest_box_score"], "validator_required_fields": ["box_score", "score"]}, "route_id": "sports_score_lookup", "semantic": 0.29577464788732394, "title": "sports score lookup"}
+  next  : route_classify.decide_next_action
+  why   : Top candidate was good enough; no fallback applied.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635876+00:00] phase=route_classify step=route_classify.next_action_decision actor=LayeredRouter
+  action: decide next action
+  input : {"ambiguous": false, "low_confidence": false, "route_id": "sports_score_lookup"}
+  output: {"next_action": "permission_check"}
+  next  : permission_check
+  why   : This is the decision branch that moves the policy to the next phase.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.635926+00:00] phase=route_classify step=route_classify.log_final_decision actor=LayeredRouter
+  action: write final route + next action
+  input : {"candidates_top_k": ["sports_score_lookup", "ask_clarification", "meta_route"]}
+  output: {"ambiguous": false, "candidates_top_k": [{"combined": 0.7535, "heuristic": 1.0, "route": {"description": "Return a final score result for team vs team lookup queries.", "id": "sports_score_lookup", "intent_terms": ["score", "final", "played", "mlb", "baseball", "game"], "negative_terms": ["deploy", "email", "password"], "phrase_terms": ["lookup", "final", "who", "won", "score", "result", "matchup"], "required_permissions": ["inspect_query", "route_classify", "permission_check", "build_plan", "execute_tools", "lookup_team_matchups", "fetch_latest_box_score", "validate", "summarize", "llm_call", "extract_slots"], "required_slots": ["team_a", "team_b"], "title": "sports score lookup", "tools": ["lookup_team_matchups", "fetch_latest_box_score"], "validator_required_fields": ["box_score", "score"]}, "route_id": "sports_score_lookup", "semantic": 0.29577464788732394, "title": "sports score lookup"}, {"combined": 0.0189, "heuristic": 0.0, "route": {"description": "Collect missing information and stop before tool execution.", "id": "ask_clarification", "required_permissions": [], "title": "ask clarification", "tools": [], "validator_required_fields": []}, "route_id": "ask_clarification", "semantic": 0.05405405405405406, "title": "ask clarification"}, {"combined": 0.0, "heuristic": 0.0, "route": {"description": "Generate temporary route plan and re-enter flow.", "id": "meta_route", "required_permissions": [], "title": "temporary plan route", "tools": [], "validator_required_fields": []}, "route_id": "meta_route", "semantic": 0.0, "title": "temporary plan route"}], "low_confidence": false, "next_action": "permission_check", "route": {"description": "Return a final score result for team vs team lookup queries.", "id": "sports_score_lookup", "intent_terms": ["score", "final", "played", "mlb", "baseball", "game"], "negative_terms": ["deploy", "email", "password"], "phrase_terms": ["lookup", "final", "who", "won", "score", "result", "matchup"], "required_permissions": ["inspect_query", "route_classify", "permission_check", "build_plan", "execute_tools", "lookup_team_matchups", "fetch_latest_box_score", "validate", "summarize", "llm_call", "extract_slots"], "required_slots": ["team_a", "team_b"], "title": "sports score lookup", "tools": ["lookup_team_matchups", "fetch_latest_box_score"], "validator_required_fields": ["box_score", "score"]}, "route_id": "sports_score_lookup", "source": "scoring"}
+  next  : permission_check
+  why   : Decision object is used by every later phase.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636661+00:00] phase=decision step=decision.meta_route_skipped actor=PolicyRouter
+  action: skip meta_route branch
+  input : {"next_action": "permission_check"}
+  output: {"skipped_branch": "meta_route"}
+  next  : permission_check
+  why   : Executed path did not request meta route.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636722+00:00] phase=decision step=decision.ask_clarification_skipped actor=PolicyRouter
+  action: skip ask_clarification branch
+  input : {"next_action": "permission_check"}
+  output: {"skipped_branch": "ask_clarification"}
+  next  : permission_check
+  why   : Executed path did not request immediate clarification.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636762+00:00] phase=permission_check step=permission_check.collect_required_permissions actor=PermissionGuard
+  action: collect required permissions
+  input : {"route_required": ["inspect_query", "route_classify", "permission_check", "build_plan", "execute_tools", "lookup_team_matchups", "fetch_latest_box_score", "validate", "summarize", "llm_call", "extract_slots"]}
+  output: {"required": ["inspect_query", "route_classify", "permission_check", "extract_slots", "build_plan", "execute_tools", "summarize", "validate", "lookup_team_matchups", "fetch_latest_box_score", "llm_call"]}
+  next  : permission_check.check_run_tests_branch
+  why   : Core and route-specific permissions are always merged.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636800+00:00] phase=permission_check step=permission_check.run_tests_route_check actor=PermissionGuard
+  action: route equals run_tests?
+  input : {"route_id": "sports_score_lookup"}
+  output: {"is_run_tests": false}
+  next  : permission_check.add_execute_tools
+  why   : A run_tests route may require execute_tools even when no tool list exists.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636824+00:00] phase=permission_check step=permission_check.add_execute_tools actor=PermissionGuard
+  action: ensure execute_tools if tools exist
+  input : {"current_permissions": ["inspect_query", "route_classify", "permission_check", "extract_slots", "build_plan", "execute_tools", "summarize", "validate", "lookup_team_matchups", "fetch_latest_box_score", "llm_call"], "needs_tools": true}
+  output: {"updated_permissions": ["inspect_query", "route_classify", "permission_check", "extract_slots", "build_plan", "execute_tools", "summarize", "validate", "lookup_team_matchups", "fetch_latest_box_score", "llm_call"]}
+  next  : permission_check.check_missing
+  why   : Permission list is normalized with execute_tools whenever a route has tools.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636871+00:00] phase=permission_check step=permission_check.missing_permissions actor=PermissionGuard
+  action: intersect required with denied/unsupported perms
+  input : {"allow": ["build_plan", "execute_tools", "fetch_latest_box_score", "inspect_query", "llm_call", "lookup_team_matchups", "permission_check", "route_classify", "summarize", "validate"], "deny": ["network", "secret_access"], "required": ["inspect_query", "route_classify", "permission_check", "extract_slots", "build_plan", "execute_tools", "summarize", "validate", "lookup_team_matchups", "fetch_latest_box_score", "llm_call"]}
+  output: {"missing_permissions": ["extract_slots"]}
+  next  : permission_check.set_next
+  why   : A permission that is denied or not explicitly allowed is considered missing.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636907+00:00] phase=permission_check step=permission_check.run_tests_branch.skipped actor=PermissionGuard
+  action: run_tests special branch skipped
+  input : {"run_tests_needed": false}
+  output: {"status": "no-op"}
+  next  : permission_check.eval_next
+  why   : run_tests branch only applies when route_id == run_tests.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636929+00:00] phase=permission_check step=permission_check.blocked actor=PermissionGuard
+  action: route blocked due to permission mismatch
+  input : {"missing_permissions": ["extract_slots"]}
+  output: {"next_action": "ask_clarification"}
+  next  : ask_clarification
+  why   : Any missing permissions must escalate before execution.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636953+00:00] phase=permission_check step=permission_check.to_ask_clarification actor=PolicyRouter
+  action: permission phase blocked, escalate
+  input : {"missing_permissions": ["extract_slots"]}
+  output: {"next_action": "ask_clarification"}
+  next  : ask_clarification
+  why   : No tool execution should start until permissions pass.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.636979+00:00] phase=ask_clarification step=ask_clarification.build_payload actor=Clarifier
+  action: build clarification payload
+  input : {"reason": "permission_check"}
+  output: {"detail": {"allowed": false, "missing_permissions": ["extract_slots"], "next_action": "ask_clarification"}, "missing_information": [], "raw_profile": {"has_final_term": true, "has_score_term": true, "has_team_hints": true, "language_hint": "en", "llm_confidence": 0.94, "llm_intent_hint": "sports_score_lookup", "normalized_query": "lookup the final score for rangers vs astros", "query": "Lookup the final score for Rangers vs Astros", "query_length": 44, "raw_query": "Lookup the final score for Rangers vs Astros", "team_a": "Texas Rangers", "team_b": "Houston Astros", "teams_detected": ["Texas Rangers", "Houston Astros"], "token_count": 8, "wants_final": true, "wants_output": true}, "reason": "permission_check", "route": "sports_score_lookup"}
+  next  : final
+  why   : When confidence is too low, or required data is missing, harness asks for clarification.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.637030+00:00] phase=ask_clarification step=ask_clarification.set_status actor=Clarifier
+  action: set final status
+  input : {"status_in": "in_progress"}
+  output: {"next_action": "final", "status": "clarification_required"}
+  next  : final
+  why   : No tool execution happens after this branch.
+------------------------------------------------------------------------------------------
+[2026-06-28T03:32:44.637104+00:00] phase=final step=final.report actor=TraceBuilder
+  action: emit final structured report
+  input : {"status": "clarification_required"}
+  output: {"final_status": "clarification_required", "trace_count": 46}
+  next  : done
+  why   : This final object is the one that can be consumed by UI/docs/tests.
+------------------------------------------------------------------------------------------
+--- FINAL JSON REPORT ---
+{
+  "status": "clarification_required",
+  "final_report": {
+    "status": "clarification_required",
+    "route": "sports_score_lookup",
+    "next_action": "permission_check",
+    "final_response": "Clarification requested. I need a clearer route, required slots, or permission.",
+    "query_profile": {
+      "query": "Lookup the final score for Rangers vs Astros",
+      "raw_query": "Lookup the final score for Rangers vs Astros",
+      "normalized_query": "lookup the final score for rangers vs astros",
+      "language_hint": "en",
+      "token_count": 8,
+      "has_score_term": true,
+      "has_final_term": true,
+      "has_team_hints": true,
+      "wants_output": true,
+      "wants_final": true,
+      "query_length": 44,
+      "llm_intent_hint": "sports_score_lookup",
+      "llm_confidence": 0.94,
+      "teams_detected": [
+        "Texas Rangers",
+        "Houston Astros"
+      ],
+      "team_a": "Texas Rangers",
+      "team_b": "Houston Astros"
+    },
+    "slots": {},
+    "plan": [],
+    "tool_calls_used": 1,
+    "validation": {
+      "passed": false,
+      "missing_fields": []
+    },
+    "missing_permissions": [
+      "extract_slots"
+    ],
+    "trace": [
+      {
+        "ts": "2026-06-28T03:32:44.627142+00:00",
+        "phase": "bootstrap",
+        "step": "bootstrap.init_state",
+        "actor": "HarnessRuntime",
+        "action": "initialize run state and trace container",
+        "input": {
+          "manifest_path": "mock_harness_route.yaml"
+        },
+        "output": {
+          "attempt": 1
+        },
+        "next_action": "bootstrap.load_manifest_path",
+        "explanation": "Everything starts with local runtime state and output tracing setup.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.627342+00:00",
+        "phase": "bootstrap",
+        "step": "bootstrap.validate_manifest_path",
+        "actor": "HarnessRuntime",
+        "action": "check manifest file exists",
+        "input": {
+          "manifest_path": "mock_harness_route.yaml"
+        },
+        "output": {
+          "exists": true
+        },
+        "next_action": "bootstrap.read_manifest",
+        "explanation": "The loader must prove the manifest path is valid before parse.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.627405+00:00",
+        "phase": "bootstrap",
+        "step": "bootstrap.read_manifest",
+        "actor": "HarnessRuntime",
+        "action": "read manifest file bytes",
+        "input": {
+          "manifest_path": "mock_harness_route.yaml"
+        },
+        "output": {
+          "file_size_bytes": 3020
+        },
+        "next_action": "bootstrap.parse_manifest_yaml",
+        "explanation": "File read happens before YAML parsing and validation.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.628386+00:00",
+        "phase": "bootstrap",
+        "step": "bootstrap.parse_manifest_yaml",
+        "actor": "HarnessRuntime",
+        "action": "parse YAML payload",
+        "input": {
+          "manifest_path": "mock_harness_route.yaml"
+        },
+        "output": {
+          "raw_preview": "route: sports_score_lookup\nversion: \"0.1.0\"\nname: \"Mock MLB Score Lookup Harness\"\ngoal: \"Demonstrate harness-style routi"
+        },
+        "next_action": "bootstrap.normalize_manifest",
+        "explanation": "The YAML text is converted to native data structures.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.633732+00:00",
+        "phase": "bootstrap",
+        "step": "bootstrap.normalize_manifest",
+        "actor": "HarnessRuntime",
+        "action": "validate manifest structure",
+        "input": {
+          "is_mapping": true
+        },
+        "output": {
+          "manifest_route": "sports_score_lookup"
+        },
+        "next_action": "bootstrap.manifest_loaded",
+        "explanation": "Normalization guarantees downstream readers can safely index manifest fields.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.633815+00:00",
+        "phase": "bootstrap",
+        "step": "bootstrap.manifest_loaded",
+        "actor": "HarnessRuntime",
+        "action": "manifest loaded and normalized",
+        "input": {
+          "manifest_path": "mock_harness_route.yaml"
+        },
+        "output": {
+          "manifest_keys": [
+            "actors",
+            "budgets",
+            "escalation",
+            "goal",
+            "name",
+            "outputs",
+            "permissions",
+            "phases",
+            "prompts",
+            "route",
+            "validators",
+            "version"
+          ]
+        },
+        "next_action": "bootstrap.load_budgets",
+        "explanation": "Manifest keys are now known; routing and validation can begin.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.633848+00:00",
+        "phase": "bootstrap",
+        "step": "bootstrap.budgets_ready",
+        "actor": "HarnessRuntime",
+        "action": "set runtime budgets from manifest",
+        "input": {
+          "manifest_budgets": {
+            "reasoning_steps_max": 12,
+            "tool_calls_max": 8,
+            "patch_attempt_max": 0,
+            "retries_max": 3
+          }
+        },
+        "output": {
+          "budgets": {
+            "reasoning_steps_max": 12,
+            "tool_calls_max": 8,
+            "patch_attempt_max": 0,
+            "retries_max": 3
+          }
+        },
+        "next_action": "bootstrap.load_route_catalog",
+        "explanation": "Tool-call/attempt limits are fixed before route scoring.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.633892+00:00",
+        "phase": "bootstrap",
+        "step": "bootstrap.route_catalog_ready",
+        "actor": "PolicyRouter",
+        "action": "prepare route catalog for scoring stage",
+        "input": {
+          "catalog_size": 4
+        },
+        "output": {
+          "route_ids": [
+            "sports_score_lookup",
+            "ask_clarification",
+            "meta_route",
+            "fallback_unknown"
+          ]
+        },
+        "next_action": "main.parse_request",
+        "explanation": "Routes are ready before the first main phase runs.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.633918+00:00",
+        "phase": "main",
+        "step": "main.receive_inputs",
+        "actor": "CLIAdapter",
+        "action": "capture incoming arguments",
+        "input": {
+          "query": "Lookup the final score for Rangers vs Astros",
+          "manifest_path": "mock_harness_route.yaml"
+        },
+        "output": {
+          "query_len": 44
+        },
+        "next_action": "main.parse_request",
+        "explanation": "The first real action is receiving and validating caller inputs.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.633939+00:00",
+        "phase": "main",
+        "step": "main.parse_request",
+        "actor": "HarnessRuntime",
+        "action": "start mock harness",
+        "input": {
+          "query": "Lookup the final score for Rangers vs Astros",
+          "manifest_path": "mock_harness_route.yaml"
+        },
+        "output": {
+          "attempt": 1
+        },
+        "next_action": "inspect_query",
+        "explanation": "Every run begins in the inspect_query phase.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.633964+00:00",
+        "phase": "inspect_query",
+        "step": "inspect_query.read_raw_query",
+        "actor": "InputReader",
+        "action": "capture raw user query",
+        "input": {
+          "query_from_cli": "Lookup the final score for Rangers vs Astros"
+        },
+        "output": {
+          "raw_query": "Lookup the final score for Rangers vs Astros"
+        },
+        "next_action": "inspect_query.normalize",
+        "explanation": "Every run starts by saving the exact user text.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634151+00:00",
+        "phase": "inspect_query",
+        "step": "inspect_query.normalize_and_tokenize",
+        "actor": "InputNormalizer",
+        "action": "normalize query text and generate tokens",
+        "input": {
+          "raw_query": "Lookup the final score for Rangers vs Astros"
+        },
+        "output": {
+          "normalized": "lookup the final score for rangers vs astros",
+          "tokens": [
+            "lookup",
+            "the",
+            "final",
+            "score",
+            "for",
+            "rangers",
+            "vs",
+            "astros"
+          ],
+          "token_set": [
+            "astros",
+            "final",
+            "for",
+            "lookup",
+            "rangers",
+            "score",
+            "the",
+            "vs"
+          ]
+        },
+        "next_action": "inspect_query.build_profile",
+        "explanation": "Lower/canonical tokens make deterministic matching stable.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634183+00:00",
+        "phase": "inspect_query",
+        "step": "inspect_query.deterministic_profile",
+        "actor": "InputProfiler",
+        "action": "build deterministic profile",
+        "input": {
+          "tokens": [
+            "lookup",
+            "the",
+            "final",
+            "score",
+            "for",
+            "rangers",
+            "vs",
+            "astros"
+          ],
+          "normalized": "lookup the final score for rangers vs astros"
+        },
+        "output": {
+          "query": "Lookup the final score for Rangers vs Astros",
+          "raw_query": "Lookup the final score for Rangers vs Astros",
+          "normalized_query": "lookup the final score for rangers vs astros",
+          "language_hint": "en",
+          "token_count": 8,
+          "has_score_term": true,
+          "has_final_term": true,
+          "has_team_hints": true,
+          "wants_output": true,
+          "wants_final": true,
+          "query_length": 44
+        },
+        "next_action": "inspect_query.llm_profile_check",
+        "explanation": "Deterministic profile is always available and never relies on LLM.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634215+00:00",
+        "phase": "inspect_query",
+        "step": "inspect_query.llm_profile_enabled",
+        "actor": "PolicyRouter",
+        "action": "check if inspect_query prompt exists",
+        "input": {
+          "has_prompt": true
+        },
+        "output": {
+          "enabled": true
+        },
+        "next_action": "inspect_query.structured_intent",
+        "explanation": "If no prompt is available, deterministic path only is used.",
+        "tool_calls_so_far": 0,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634238+00:00",
+        "phase": "inspect_query",
+        "step": "inspect_query.structured_intent_json",
+        "actor": "MockLLM",
+        "action": "parse intent JSON from query",
+        "input": {
+          "model": "mock-llm",
+          "prompt": "You are a deterministic sports-intent parser.\nConvert the user query into strict JSON with this schema:\n{\n  \"intent\": \"sports_score_lookup\",\n  \"teams_detected\": [\"canonical_team_name\", ...],\n  \"sport_hint\": \"mlb\" | null,\n  \"needs_final\": true | false,\n  \"wants_score\": true | false,\n  \"raw_query\": \"<original query>\"\n}\nRules:\n- Normalize teams to canonical names when possible: rangers -> Texas Rangers, astros -> Houston Astros.\n- If a team mention is missing, keep list empty rather than guessing.\n",
+          "query": "Lookup the final score for Rangers vs Astros"
+        },
+        "output": {
+          "intent": "sports_score_lookup",
+          "teams_detected": [
+            "Texas Rangers",
+            "Houston Astros"
+          ],
+          "sport_hint": "mlb",
+          "needs_final": true,
+          "wants_score": true,
+          "raw_query": "Lookup the final score for Rangers vs Astros",
+          "language_hint": "en",
+          "confidence": 0.94
+        },
+        "next_action": "inspect_query.merge_profiles",
+        "explanation": "Mock structured parser returns route_hint, team hints, and confidence.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634603+00:00",
+        "phase": "inspect_query",
+        "step": "inspect_query.merge_profiles",
+        "actor": "PolicyRouter",
+        "action": "merge deterministic + LLM profile",
+        "input": {
+          "deterministic": {
+            "query": "Lookup the final score for Rangers vs Astros",
+            "raw_query": "Lookup the final score for Rangers vs Astros",
+            "normalized_query": "lookup the final score for rangers vs astros",
+            "language_hint": "en",
+            "token_count": 8,
+            "has_score_term": true,
+            "has_final_term": true,
+            "has_team_hints": true,
+            "wants_output": true,
+            "wants_final": true,
+            "query_length": 44
+          },
+          "llm_profile": {
+            "intent": "sports_score_lookup",
+            "teams_detected": [
+              "Texas Rangers",
+              "Houston Astros"
+            ],
+            "sport_hint": "mlb",
+            "needs_final": true,
+            "wants_score": true,
+            "raw_query": "Lookup the final score for Rangers vs Astros",
+            "language_hint": "en",
+            "confidence": 0.94
+          }
+        },
+        "output": {
+          "query": "Lookup the final score for Rangers vs Astros",
+          "raw_query": "Lookup the final score for Rangers vs Astros",
+          "normalized_query": "lookup the final score for rangers vs astros",
+          "language_hint": "en",
+          "token_count": 8,
+          "has_score_term": true,
+          "has_final_term": true,
+          "has_team_hints": true,
+          "wants_output": true,
+          "wants_final": true,
+          "query_length": 44,
+          "llm_intent_hint": "sports_score_lookup",
+          "llm_confidence": 0.94,
+          "teams_detected": [
+            "Texas Rangers",
+            "Houston Astros"
+          ],
+          "team_a": "Texas Rangers",
+          "team_b": "Houston Astros"
+        },
+        "next_action": "route_classify",
+        "explanation": "This merged profile drives every downstream phase.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634735+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.heuristic_score",
+        "actor": "LayeredRouter",
+        "action": "phrase + intent matching score",
+        "input": {
+          "route": "sports_score_lookup",
+          "query": "lookup the final score for rangers vs astros"
+        },
+        "output": {
+          "heuristic_raw": 1.5499999999999998,
+          "heuristic_clamped": 1.0
+        },
+        "next_action": "route_classify.semantic_score",
+        "explanation": "Phrase matches raise score; explicit negative terms lower score.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634824+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.semantic_score",
+        "actor": "LayeredRouter",
+        "action": "semantic overlap (n-gram overlap stub)",
+        "input": {
+          "route": "sports_score_lookup",
+          "route_text": "sports score lookup return a final score result for team vs team lookup queries. sports_score_lookup"
+        },
+        "output": {
+          "semantic_score": 0.2958
+        },
+        "next_action": "route_classify.combine_scores",
+        "explanation": "This is a deterministic approximation for teaching instead of a real embedding model.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634857+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.combined_score",
+        "actor": "LayeredRouter",
+        "action": "combine candidate scores",
+        "input": {
+          "route": "sports_score_lookup",
+          "heuristic": 1.0,
+          "semantic": 0.29577464788732394,
+          "penalty": 0.0
+        },
+        "output": {
+          "combined": 0.7535
+        },
+        "next_action": "route_classify.sort_top_k",
+        "explanation": "Combined score is one deterministic number used for ranking.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634907+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.heuristic_score",
+        "actor": "LayeredRouter",
+        "action": "phrase + intent matching score",
+        "input": {
+          "route": "ask_clarification",
+          "query": "lookup the final score for rangers vs astros"
+        },
+        "output": {
+          "heuristic_raw": 0.0,
+          "heuristic_clamped": 0.0
+        },
+        "next_action": "route_classify.semantic_score",
+        "explanation": "Phrase matches raise score; explicit negative terms lower score.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634968+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.semantic_score",
+        "actor": "LayeredRouter",
+        "action": "semantic overlap (n-gram overlap stub)",
+        "input": {
+          "route": "ask_clarification",
+          "route_text": "ask clarification collect missing information and stop before tool execution. ask_clarification"
+        },
+        "output": {
+          "semantic_score": 0.0541
+        },
+        "next_action": "route_classify.combine_scores",
+        "explanation": "This is a deterministic approximation for teaching instead of a real embedding model.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.634994+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.combined_score",
+        "actor": "LayeredRouter",
+        "action": "combine candidate scores",
+        "input": {
+          "route": "ask_clarification",
+          "heuristic": 0.0,
+          "semantic": 0.05405405405405406,
+          "penalty": 0.0
+        },
+        "output": {
+          "combined": 0.0189
+        },
+        "next_action": "route_classify.sort_top_k",
+        "explanation": "Combined score is one deterministic number used for ranking.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635028+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.heuristic_score",
+        "actor": "LayeredRouter",
+        "action": "phrase + intent matching score",
+        "input": {
+          "route": "meta_route",
+          "query": "lookup the final score for rangers vs astros"
+        },
+        "output": {
+          "heuristic_raw": 0.0,
+          "heuristic_clamped": 0.0
+        },
+        "next_action": "route_classify.semantic_score",
+        "explanation": "Phrase matches raise score; explicit negative terms lower score.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635077+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.semantic_score",
+        "actor": "LayeredRouter",
+        "action": "semantic overlap (n-gram overlap stub)",
+        "input": {
+          "route": "meta_route",
+          "route_text": "temporary plan route generate temporary route plan and re-enter flow. meta_route"
+        },
+        "output": {
+          "semantic_score": 0.0
+        },
+        "next_action": "route_classify.combine_scores",
+        "explanation": "This is a deterministic approximation for teaching instead of a real embedding model.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635096+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.combined_score",
+        "actor": "LayeredRouter",
+        "action": "combine candidate scores",
+        "input": {
+          "route": "meta_route",
+          "heuristic": 0.0,
+          "semantic": 0.0,
+          "penalty": 0.0
+        },
+        "output": {
+          "combined": 0.0
+        },
+        "next_action": "route_classify.sort_top_k",
+        "explanation": "Combined score is one deterministic number used for ranking.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635117+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.heuristic_score",
+        "actor": "LayeredRouter",
+        "action": "phrase + intent matching score",
+        "input": {
+          "route": "fallback_unknown",
+          "query": "lookup the final score for rangers vs astros"
+        },
+        "output": {
+          "heuristic_raw": 0.0,
+          "heuristic_clamped": 0.0
+        },
+        "next_action": "route_classify.semantic_score",
+        "explanation": "Phrase matches raise score; explicit negative terms lower score.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635153+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.semantic_score",
+        "actor": "LayeredRouter",
+        "action": "semantic overlap (n-gram overlap stub)",
+        "input": {
+          "route": "fallback_unknown",
+          "route_text": "generic fallback generic fallback when no route is a clean match. fallback_unknown"
+        },
+        "output": {
+          "semantic_score": 0.0172
+        },
+        "next_action": "route_classify.combine_scores",
+        "explanation": "This is a deterministic approximation for teaching instead of a real embedding model.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635174+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.combined_score",
+        "actor": "LayeredRouter",
+        "action": "combine candidate scores",
+        "input": {
+          "route": "fallback_unknown",
+          "heuristic": 0.0,
+          "semantic": 0.017241379310344827,
+          "penalty": 0.1
+        },
+        "output": {
+          "combined": -0.094
+        },
+        "next_action": "route_classify.sort_top_k",
+        "explanation": "Combined score is one deterministic number used for ranking.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635193+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.iterate_and_score",
+        "actor": "LayeredRouter",
+        "action": "compute candidate score for every route",
+        "input": {
+          "route_count": 4
+        },
+        "output": [
+          {
+            "route_id": "sports_score_lookup",
+            "title": "sports score lookup",
+            "heuristic": 1.0,
+            "semantic": 0.29577464788732394,
+            "combined": 0.7535,
+            "route": {
+              "id": "sports_score_lookup",
+              "title": "sports score lookup",
+              "description": "Return a final score result for team vs team lookup queries.",
+              "phrase_terms": [
+                "lookup",
+                "final",
+                "who",
+                "won",
+                "score",
+                "result",
+                "matchup"
+              ],
+              "intent_terms": [
+                "score",
+                "final",
+                "played",
+                "mlb",
+                "baseball",
+                "game"
+              ],
+              "negative_terms": [
+                "deploy",
+                "email",
+                "password"
+              ],
+              "required_permissions": [
+                "inspect_query",
+                "route_classify",
+                "permission_check",
+                "build_plan",
+                "execute_tools",
+                "lookup_team_matchups",
+                "fetch_latest_box_score",
+                "validate",
+                "summarize",
+                "llm_call",
+                "extract_slots"
+              ],
+              "required_slots": [
+                "team_a",
+                "team_b"
+              ],
+              "tools": [
+                "lookup_team_matchups",
+                "fetch_latest_box_score"
+              ],
+              "validator_required_fields": [
+                "box_score",
+                "score"
+              ]
+            }
+          },
+          {
+            "route_id": "ask_clarification",
+            "title": "ask clarification",
+            "heuristic": 0.0,
+            "semantic": 0.05405405405405406,
+            "combined": 0.0189,
+            "route": {
+              "id": "ask_clarification",
+              "title": "ask clarification",
+              "description": "Collect missing information and stop before tool execution.",
+              "required_permissions": [],
+              "tools": [],
+              "validator_required_fields": []
+            }
+          },
+          {
+            "route_id": "meta_route",
+            "title": "temporary plan route",
+            "heuristic": 0.0,
+            "semantic": 0.0,
+            "combined": 0.0,
+            "route": {
+              "id": "meta_route",
+              "title": "temporary plan route",
+              "description": "Generate temporary route plan and re-enter flow.",
+              "required_permissions": [],
+              "tools": [],
+              "validator_required_fields": []
+            }
+          },
+          {
+            "route_id": "fallback_unknown",
+            "title": "generic fallback",
+            "heuristic": 0.0,
+            "semantic": 0.017241379310344827,
+            "combined": 0.0,
+            "route": {
+              "id": "fallback_unknown",
+              "title": "generic fallback",
+              "description": "Generic fallback when no route is a clean match.",
+              "required_permissions": [],
+              "tools": [],
+              "validator_required_fields": []
+            }
+          }
+        ],
+        "next_action": "route_classify.top_k",
+        "explanation": "The route list is fully iterated to keep scoring deterministic and explainable.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635666+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.sort_top_k",
+        "actor": "LayeredRouter",
+        "action": "sort by combined score and keep top-k",
+        "input": {
+          "k": 3
+        },
+        "output": [
+          {
+            "route_id": "sports_score_lookup",
+            "title": "sports score lookup",
+            "heuristic": 1.0,
+            "semantic": 0.29577464788732394,
+            "combined": 0.7535,
+            "route": {
+              "id": "sports_score_lookup",
+              "title": "sports score lookup",
+              "description": "Return a final score result for team vs team lookup queries.",
+              "phrase_terms": [
+                "lookup",
+                "final",
+                "who",
+                "won",
+                "score",
+                "result",
+                "matchup"
+              ],
+              "intent_terms": [
+                "score",
+                "final",
+                "played",
+                "mlb",
+                "baseball",
+                "game"
+              ],
+              "negative_terms": [
+                "deploy",
+                "email",
+                "password"
+              ],
+              "required_permissions": [
+                "inspect_query",
+                "route_classify",
+                "permission_check",
+                "build_plan",
+                "execute_tools",
+                "lookup_team_matchups",
+                "fetch_latest_box_score",
+                "validate",
+                "summarize",
+                "llm_call",
+                "extract_slots"
+              ],
+              "required_slots": [
+                "team_a",
+                "team_b"
+              ],
+              "tools": [
+                "lookup_team_matchups",
+                "fetch_latest_box_score"
+              ],
+              "validator_required_fields": [
+                "box_score",
+                "score"
+              ]
+            }
+          },
+          {
+            "route_id": "ask_clarification",
+            "title": "ask clarification",
+            "heuristic": 0.0,
+            "semantic": 0.05405405405405406,
+            "combined": 0.0189,
+            "route": {
+              "id": "ask_clarification",
+              "title": "ask clarification",
+              "description": "Collect missing information and stop before tool execution.",
+              "required_permissions": [],
+              "tools": [],
+              "validator_required_fields": []
+            }
+          },
+          {
+            "route_id": "meta_route",
+            "title": "temporary plan route",
+            "heuristic": 0.0,
+            "semantic": 0.0,
+            "combined": 0.0,
+            "route": {
+              "id": "meta_route",
+              "title": "temporary plan route",
+              "description": "Generate temporary route plan and re-enter flow.",
+              "required_permissions": [],
+              "tools": [],
+              "validator_required_fields": []
+            }
+          }
+        ],
+        "next_action": "route_classify.ambiguity_check",
+        "explanation": "Top candidates are still available for rerank + fallback logic.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635771+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.ambiguity_check",
+        "actor": "LayeredRouter",
+        "action": "check low-confidence + ambiguity",
+        "input": {
+          "top1": 0.7535,
+          "top2": 0.0189
+        },
+        "output": {
+          "low_confidence": false,
+          "ambiguous": false
+        },
+        "next_action": "route_classify.llm_rerank_or_accept",
+        "explanation": "Both low confidence and ambiguity gates are evaluated here.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635804+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.skip_llm_fallback",
+        "actor": "LayeredRouter",
+        "action": "skip mock LLM rerank",
+        "input": {
+          "low_confidence": false,
+          "ambiguous": false
+        },
+        "output": {
+          "reason": "confidence route",
+          "chosen": "sports_score_lookup"
+        },
+        "next_action": "route_classify.apply_fallback",
+        "explanation": "LLM rerank is only called on weak/ambiguous scoring in this teaching path.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635832+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.apply_fallback",
+        "actor": "LayeredRouter",
+        "action": "accept top candidate",
+        "input": {
+          "candidate": "sports_score_lookup"
+        },
+        "output": {
+          "route_id": "sports_score_lookup",
+          "title": "sports score lookup",
+          "heuristic": 1.0,
+          "semantic": 0.29577464788732394,
+          "combined": 0.7535,
+          "route": {
+            "id": "sports_score_lookup",
+            "title": "sports score lookup",
+            "description": "Return a final score result for team vs team lookup queries.",
+            "phrase_terms": [
+              "lookup",
+              "final",
+              "who",
+              "won",
+              "score",
+              "result",
+              "matchup"
+            ],
+            "intent_terms": [
+              "score",
+              "final",
+              "played",
+              "mlb",
+              "baseball",
+              "game"
+            ],
+            "negative_terms": [
+              "deploy",
+              "email",
+              "password"
+            ],
+            "required_permissions": [
+              "inspect_query",
+              "route_classify",
+              "permission_check",
+              "build_plan",
+              "execute_tools",
+              "lookup_team_matchups",
+              "fetch_latest_box_score",
+              "validate",
+              "summarize",
+              "llm_call",
+              "extract_slots"
+            ],
+            "required_slots": [
+              "team_a",
+              "team_b"
+            ],
+            "tools": [
+              "lookup_team_matchups",
+              "fetch_latest_box_score"
+            ],
+            "validator_required_fields": [
+              "box_score",
+              "score"
+            ]
+          }
+        },
+        "next_action": "route_classify.decide_next_action",
+        "explanation": "Top candidate was good enough; no fallback applied.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635876+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.next_action_decision",
+        "actor": "LayeredRouter",
+        "action": "decide next action",
+        "input": {
+          "route_id": "sports_score_lookup",
+          "low_confidence": false,
+          "ambiguous": false
+        },
+        "output": {
+          "next_action": "permission_check"
+        },
+        "next_action": "permission_check",
+        "explanation": "This is the decision branch that moves the policy to the next phase.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.635926+00:00",
+        "phase": "route_classify",
+        "step": "route_classify.log_final_decision",
+        "actor": "LayeredRouter",
+        "action": "write final route + next action",
+        "input": {
+          "candidates_top_k": [
+            "sports_score_lookup",
+            "ask_clarification",
+            "meta_route"
+          ]
+        },
+        "output": {
+          "route_id": "sports_score_lookup",
+          "route": {
+            "id": "sports_score_lookup",
+            "title": "sports score lookup",
+            "description": "Return a final score result for team vs team lookup queries.",
+            "phrase_terms": [
+              "lookup",
+              "final",
+              "who",
+              "won",
+              "score",
+              "result",
+              "matchup"
+            ],
+            "intent_terms": [
+              "score",
+              "final",
+              "played",
+              "mlb",
+              "baseball",
+              "game"
+            ],
+            "negative_terms": [
+              "deploy",
+              "email",
+              "password"
+            ],
+            "required_permissions": [
+              "inspect_query",
+              "route_classify",
+              "permission_check",
+              "build_plan",
+              "execute_tools",
+              "lookup_team_matchups",
+              "fetch_latest_box_score",
+              "validate",
+              "summarize",
+              "llm_call",
+              "extract_slots"
+            ],
+            "required_slots": [
+              "team_a",
+              "team_b"
+            ],
+            "tools": [
+              "lookup_team_matchups",
+              "fetch_latest_box_score"
+            ],
+            "validator_required_fields": [
+              "box_score",
+              "score"
+            ]
+          },
+          "next_action": "permission_check",
+          "candidates_top_k": [
+            {
+              "route_id": "sports_score_lookup",
+              "title": "sports score lookup",
+              "heuristic": 1.0,
+              "semantic": 0.29577464788732394,
+              "combined": 0.7535,
+              "route": {
+                "id": "sports_score_lookup",
+                "title": "sports score lookup",
+                "description": "Return a final score result for team vs team lookup queries.",
+                "phrase_terms": [
+                  "lookup",
+                  "final",
+                  "who",
+                  "won",
+                  "score",
+                  "result",
+                  "matchup"
+                ],
+                "intent_terms": [
+                  "score",
+                  "final",
+                  "played",
+                  "mlb",
+                  "baseball",
+                  "game"
+                ],
+                "negative_terms": [
+                  "deploy",
+                  "email",
+                  "password"
+                ],
+                "required_permissions": [
+                  "inspect_query",
+                  "route_classify",
+                  "permission_check",
+                  "build_plan",
+                  "execute_tools",
+                  "lookup_team_matchups",
+                  "fetch_latest_box_score",
+                  "validate",
+                  "summarize",
+                  "llm_call",
+                  "extract_slots"
+                ],
+                "required_slots": [
+                  "team_a",
+                  "team_b"
+                ],
+                "tools": [
+                  "lookup_team_matchups",
+                  "fetch_latest_box_score"
+                ],
+                "validator_required_fields": [
+                  "box_score",
+                  "score"
+                ]
+              }
+            },
+            {
+              "route_id": "ask_clarification",
+              "title": "ask clarification",
+              "heuristic": 0.0,
+              "semantic": 0.05405405405405406,
+              "combined": 0.0189,
+              "route": {
+                "id": "ask_clarification",
+                "title": "ask clarification",
+                "description": "Collect missing information and stop before tool execution.",
+                "required_permissions": [],
+                "tools": [],
+                "validator_required_fields": []
+              }
+            },
+            {
+              "route_id": "meta_route",
+              "title": "temporary plan route",
+              "heuristic": 0.0,
+              "semantic": 0.0,
+              "combined": 0.0,
+              "route": {
+                "id": "meta_route",
+                "title": "temporary plan route",
+                "description": "Generate temporary route plan and re-enter flow.",
+                "required_permissions": [],
+                "tools": [],
+                "validator_required_fields": []
+              }
+            }
+          ],
+          "low_confidence": false,
+          "ambiguous": false,
+          "source": "scoring"
+        },
+        "next_action": "permission_check",
+        "explanation": "Decision object is used by every later phase.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636661+00:00",
+        "phase": "decision",
+        "step": "decision.meta_route_skipped",
+        "actor": "PolicyRouter",
+        "action": "skip meta_route branch",
+        "input": {
+          "next_action": "permission_check"
+        },
+        "output": {
+          "skipped_branch": "meta_route"
+        },
+        "next_action": "permission_check",
+        "explanation": "Executed path did not request meta route.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636722+00:00",
+        "phase": "decision",
+        "step": "decision.ask_clarification_skipped",
+        "actor": "PolicyRouter",
+        "action": "skip ask_clarification branch",
+        "input": {
+          "next_action": "permission_check"
+        },
+        "output": {
+          "skipped_branch": "ask_clarification"
+        },
+        "next_action": "permission_check",
+        "explanation": "Executed path did not request immediate clarification.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636762+00:00",
+        "phase": "permission_check",
+        "step": "permission_check.collect_required_permissions",
+        "actor": "PermissionGuard",
+        "action": "collect required permissions",
+        "input": {
+          "route_required": [
+            "inspect_query",
+            "route_classify",
+            "permission_check",
+            "build_plan",
+            "execute_tools",
+            "lookup_team_matchups",
+            "fetch_latest_box_score",
+            "validate",
+            "summarize",
+            "llm_call",
+            "extract_slots"
+          ]
+        },
+        "output": {
+          "required": [
+            "inspect_query",
+            "route_classify",
+            "permission_check",
+            "extract_slots",
+            "build_plan",
+            "execute_tools",
+            "summarize",
+            "validate",
+            "lookup_team_matchups",
+            "fetch_latest_box_score",
+            "llm_call"
+          ]
+        },
+        "next_action": "permission_check.check_run_tests_branch",
+        "explanation": "Core and route-specific permissions are always merged.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636800+00:00",
+        "phase": "permission_check",
+        "step": "permission_check.run_tests_route_check",
+        "actor": "PermissionGuard",
+        "action": "route equals run_tests?",
+        "input": {
+          "route_id": "sports_score_lookup"
+        },
+        "output": {
+          "is_run_tests": false
+        },
+        "next_action": "permission_check.add_execute_tools",
+        "explanation": "A run_tests route may require execute_tools even when no tool list exists.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636824+00:00",
+        "phase": "permission_check",
+        "step": "permission_check.add_execute_tools",
+        "actor": "PermissionGuard",
+        "action": "ensure execute_tools if tools exist",
+        "input": {
+          "needs_tools": true,
+          "current_permissions": [
+            "inspect_query",
+            "route_classify",
+            "permission_check",
+            "extract_slots",
+            "build_plan",
+            "execute_tools",
+            "summarize",
+            "validate",
+            "lookup_team_matchups",
+            "fetch_latest_box_score",
+            "llm_call"
+          ]
+        },
+        "output": {
+          "updated_permissions": [
+            "inspect_query",
+            "route_classify",
+            "permission_check",
+            "extract_slots",
+            "build_plan",
+            "execute_tools",
+            "summarize",
+            "validate",
+            "lookup_team_matchups",
+            "fetch_latest_box_score",
+            "llm_call"
+          ]
+        },
+        "next_action": "permission_check.check_missing",
+        "explanation": "Permission list is normalized with execute_tools whenever a route has tools.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636871+00:00",
+        "phase": "permission_check",
+        "step": "permission_check.missing_permissions",
+        "actor": "PermissionGuard",
+        "action": "intersect required with denied/unsupported perms",
+        "input": {
+          "required": [
+            "inspect_query",
+            "route_classify",
+            "permission_check",
+            "extract_slots",
+            "build_plan",
+            "execute_tools",
+            "summarize",
+            "validate",
+            "lookup_team_matchups",
+            "fetch_latest_box_score",
+            "llm_call"
+          ],
+          "allow": [
+            "build_plan",
+            "execute_tools",
+            "fetch_latest_box_score",
+            "inspect_query",
+            "llm_call",
+            "lookup_team_matchups",
+            "permission_check",
+            "route_classify",
+            "summarize",
+            "validate"
+          ],
+          "deny": [
+            "network",
+            "secret_access"
+          ]
+        },
+        "output": {
+          "missing_permissions": [
+            "extract_slots"
+          ]
+        },
+        "next_action": "permission_check.set_next",
+        "explanation": "A permission that is denied or not explicitly allowed is considered missing.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636907+00:00",
+        "phase": "permission_check",
+        "step": "permission_check.run_tests_branch.skipped",
+        "actor": "PermissionGuard",
+        "action": "run_tests special branch skipped",
+        "input": {
+          "run_tests_needed": false
+        },
+        "output": {
+          "status": "no-op"
+        },
+        "next_action": "permission_check.eval_next",
+        "explanation": "run_tests branch only applies when route_id == run_tests.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636929+00:00",
+        "phase": "permission_check",
+        "step": "permission_check.blocked",
+        "actor": "PermissionGuard",
+        "action": "route blocked due to permission mismatch",
+        "input": {
+          "missing_permissions": [
+            "extract_slots"
+          ]
+        },
+        "output": {
+          "next_action": "ask_clarification"
+        },
+        "next_action": "ask_clarification",
+        "explanation": "Any missing permissions must escalate before execution.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636953+00:00",
+        "phase": "permission_check",
+        "step": "permission_check.to_ask_clarification",
+        "actor": "PolicyRouter",
+        "action": "permission phase blocked, escalate",
+        "input": {
+          "missing_permissions": [
+            "extract_slots"
+          ]
+        },
+        "output": {
+          "next_action": "ask_clarification"
+        },
+        "next_action": "ask_clarification",
+        "explanation": "No tool execution should start until permissions pass.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.636979+00:00",
+        "phase": "ask_clarification",
+        "step": "ask_clarification.build_payload",
+        "actor": "Clarifier",
+        "action": "build clarification payload",
+        "input": {
+          "reason": "permission_check"
+        },
+        "output": {
+          "missing_information": [],
+          "reason": "permission_check",
+          "raw_profile": {
+            "query": "Lookup the final score for Rangers vs Astros",
+            "raw_query": "Lookup the final score for Rangers vs Astros",
+            "normalized_query": "lookup the final score for rangers vs astros",
+            "language_hint": "en",
+            "token_count": 8,
+            "has_score_term": true,
+            "has_final_term": true,
+            "has_team_hints": true,
+            "wants_output": true,
+            "wants_final": true,
+            "query_length": 44,
+            "llm_intent_hint": "sports_score_lookup",
+            "llm_confidence": 0.94,
+            "teams_detected": [
+              "Texas Rangers",
+              "Houston Astros"
+            ],
+            "team_a": "Texas Rangers",
+            "team_b": "Houston Astros"
+          },
+          "route": "sports_score_lookup",
+          "detail": {
+            "next_action": "ask_clarification",
+            "allowed": false,
+            "missing_permissions": [
+              "extract_slots"
+            ]
+          }
+        },
+        "next_action": "final",
+        "explanation": "When confidence is too low, or required data is missing, harness asks for clarification.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      },
+      {
+        "ts": "2026-06-28T03:32:44.637030+00:00",
+        "phase": "ask_clarification",
+        "step": "ask_clarification.set_status",
+        "actor": "Clarifier",
+        "action": "set final status",
+        "input": {
+          "status_in": "in_progress"
+        },
+        "output": {
+          "status": "clarification_required",
+          "next_action": "final"
+        },
+        "next_action": "final",
+        "explanation": "No tool execution happens after this branch.",
+        "tool_calls_so_far": 1,
+        "attempt": 1
+      }
+    ],
+    "budgets": {
+      "reasoning_steps_max": 12,
+      "tool_calls_max": 8,
+      "patch_attempt_max": 0,
+      "retries_max": 3
+    },
+    "attempt": 1,
+    "attempts_available": 3,
+    "evidence": {}
+  }
+}
