@@ -18,6 +18,7 @@ It does not contain hardcoded query-topic dictionaries.
 from __future__ import annotations
 
 import argparse
+import sys
 import json
 import math
 import os
@@ -2073,7 +2074,12 @@ def main() -> None:
     )
     result = engine.run(args.query)
     print("\n=== HARNESS FINAL REPORT ===")
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    payload = json.dumps(result, indent=2, ensure_ascii=False)
+    try:
+        print(payload)
+    except UnicodeEncodeError:
+        sys.stdout.buffer.write(payload.encode("utf-8"))
+        sys.stdout.buffer.write(b"\n")
 
 
 if __name__ == "__main__":

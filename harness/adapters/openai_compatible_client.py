@@ -54,14 +54,21 @@ class OpenAICompatibleClient(BaseModelClient):
         if self.extra_body:
             payload.update(self.extra_body)
 
-        async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    json=payload,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"model_backend_unavailable: failed to reach model backend: {exc}") from exc
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            status_code = response.status_code if response is not None else "unknown"
+            raise RuntimeError(f"model_request_failed: backend returned status {status_code}") from exc
 
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})

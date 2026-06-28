@@ -211,3 +211,4 @@ Parity checks now include:
 - `next_action` parity
 - permission-block behavior
 - evidence presence parity
+- runtime/infra parity checks for backend availability and provider catalog checks (`Get-HarnessBackendStatus` runtime plane + provider plane output)

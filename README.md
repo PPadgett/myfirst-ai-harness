@@ -34,12 +34,39 @@ Recommended rollout controls:
 
 - Demo run:
   - `python real_ai_harness.py --query "..." --no-network`
-- Production local server:
-  - `python -m harness.server --config harness.yaml`
+- Production server/local backend start:
+  - `. .\scripts\Invoke-HarnessOneShot.ps1`
+  - `Start-HarnessBackend -ExecutionMode local -Config harness.yaml -WaitSeconds 30`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -UseExistingServer`
+  - `Stop-HarnessBackend -ExecutionMode local -Config harness.yaml`
+- Containerized NVIDIA/Ollama backend stack:
+  - `. .\scripts\Invoke-HarnessOneShot.ps1`
+  - `Start-HarnessBackend -ExecutionMode containerized -Config harness.yaml -EnvFile .env.nvidia`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -UseExistingServer`
+  - `Stop-HarnessBackend -ExecutionMode containerized -Config harness.yaml -EnvFile .env.nvidia`
+- Backend lifecycle template (single flow):
+  - `. .\scripts\Invoke-HarnessOneShot.ps1`
+  - `Start-HarnessBackend -ExecutionMode local -Config harness.yaml`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the most played music video ever?" -UseExistingServer`
+  - `Get-HarnessBackendStatus -Config harness.yaml`
+  - `Stop-HarnessBackend -ExecutionMode local -Config harness.yaml`
+- NVIDIA container lifecycle template:
+  - `. .\scripts\Invoke-HarnessOneShot.ps1`
+  - `Start-HarnessBackend -ExecutionMode containerized -Config harness-nvidia.yaml -EnvFile .env.nvidia`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the most played music video ever?" -UseExistingServer`
+  - `Get-HarnessBackendStatus -Config harness-nvidia.yaml`
+  - `Stop-HarnessBackend -ExecutionMode containerized -Config harness-nvidia.yaml -EnvFile .env.nvidia`
 - PowerShell one-shot helper:
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -FeatureLevel hardening -RequireEvidence -ToolSandbox off`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?"`
-  - `Invoke-HarnessOneShot -Mode demo -Question "What is the best way to write tests?" --NoNetwork`
+  - `Invoke-HarnessOneShot -Mode demo -Question "What is the best way to write tests?" -NoNetwork`
+- Use the helper parameters above instead of manual `$env:` assignments in the same one-liner; passing `-FeatureLevel`, `-RequireEvidence`, `-ToolSandbox`, and `-EnableAdvancedRouter` directly avoids PowerShell parsing edge cases.
+- Status checks:
+  - `Get-HarnessBackendStatus -Config harness.yaml -ServerHost 127.0.0.1 -Port 8080`
+  - `Get-HarnessBackendStatus -Config harness.yaml -IncludeSession`
+  - `Get-HarnessBackendStatus -Config harness.yaml -PreferProviderOnly`
+- `Get-HarnessBackendStatus` reports runtime `/health` and provider model-catalog availability, with `-PreferProviderOnly` providing a provider-only health check.
 - Baseline/parity scripts:
   - `python scripts/run_parity_sanity.py --print-json`
   - `python tests/benchmarks/run_trace_regression.py`
@@ -177,6 +204,7 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/chat/completions" -Method Post 
 - `scripts/Invoke-HarnessOneShot.ps1` is built on shared runtime helper logic (`harness/oneshot.py`).
 - Runtime mode uses model resolution order: explicit `-Model` (when supplied), then `harness.yaml`, then environment/config defaults.
 - When `-Model` is omitted in runtime mode, the generated payload does **not** include `model`; the server uses config/runtime defaults, which avoids model/request-body mismatches.
+- If you see provider errors during runtime mode, start with `Get-HarnessBackendStatus -PreferProviderOnly` to verify provider reachability and model presence independently of runtime health.
 
 ## Runtime config (`harness.yaml`)
 

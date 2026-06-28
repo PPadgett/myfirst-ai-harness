@@ -291,6 +291,108 @@ async def test_unknown_tool_is_hard_fail_in_runtime_with_validation_blocked(monk
 
 
 @pytest.mark.asyncio
+async def test_model_backend_unavailable_during_tool_plan_is_returned_as_validation_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _MockClient:
+        async def generate(self, req: ModelGenerateRequest) -> ModelGenerateResult:
+            raise RuntimeError("model_backend_unavailable: failed to reach model backend: connect failure")
+
+    config = load_runtime_config()
+    config.feature_level = "basic"
+    config.require_evidence = False
+    config.tool_allowlist = ("run_tests",)
+
+    runtime = HarnessRuntime(config, _MockClient())
+    forced_route = RoutePolicy(
+        route=Route.TOOL_REQUIRED,
+        use_retrieval=False,
+        use_tools=True,
+        strict_schema=False,
+        require_verification=False,
+        allow_reasoning=False,
+        thinking_budget="low",
+        max_model_calls=1,
+        temperature=0.2,
+        max_new_tokens=64,
+        allowed_tools=("run_tests",),
+        max_tool_calls_per_turn=1,
+        required_evidence_fields=(),
+        hard_fail_errors=(),
+        tool_sandbox_required=(),
+        route_metadata={},
+    )
+
+    monkeypatch.setattr(runtime_module, "classify_route", lambda *_args, **_kwargs: forced_route)
+
+    response = await runtime.process(
+        {
+            "messages": [{"role": "user", "content": "run tests please"}],
+            "model": str(runtime.config.model),
+            "response_schema": None,
+            "request_id": "runtime-toolplan-backend-fail",
+            "toolset": ["run_tests"],
+        }
+    )
+
+    assert response["status"] == "validation_block"
+    assert response["next_action"] == "ask_clarification"
+    assert response["validation"]["ok"] is False
+    assert response["validation"].get("error_codes") == ["model_backend_unavailable"]
+    assert response["error_code"] == "model_backend_unavailable"
+    assert response["run_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_model_request_failed_during_final_generate_is_mapped_to_backend_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _MockClient:
+        async def generate(self, req: ModelGenerateRequest) -> ModelGenerateResult:
+            raise RuntimeError("model_request_failed: backend returned status 500")
+
+    config = load_runtime_config()
+    config.feature_level = "basic"
+    config.require_evidence = False
+    config.tool_allowlist = ()
+
+    runtime = HarnessRuntime(config, _MockClient())
+    forced_route = RoutePolicy(
+        route=Route.DIRECT,
+        use_retrieval=False,
+        use_tools=False,
+        strict_schema=False,
+        require_verification=False,
+        allow_reasoning=False,
+        thinking_budget="low",
+        max_model_calls=1,
+        temperature=0.2,
+        max_new_tokens=64,
+        allowed_tools=(),
+        max_tool_calls_per_turn=0,
+        required_evidence_fields=(),
+        hard_fail_errors=(),
+        tool_sandbox_required=(),
+        route_metadata={},
+    )
+    # This route forces no tool planning branch and goes directly to final generation.
+    forced_route.max_tool_calls = 0
+    monkeypatch.setattr(runtime_module, "classify_route", lambda *_args, **_kwargs: forced_route)
+
+    response = await runtime.process(
+        {
+            "messages": [{"role": "user", "content": "tell me the answer"}],
+            "model": str(runtime.config.model),
+            "response_schema": None,
+            "request_id": "runtime-final-backend-fail",
+            "toolset": [],
+        }
+    )
+
+    assert response["status"] == "validation_block"
+    assert response["next_action"] == "ask_clarification"
+    assert response["validation"]["ok"] is False
+    assert response["validation"].get("error_codes") == ["model_request_failed"]
+    assert response["error_code"] == "model_request_failed"
+
+
+@pytest.mark.asyncio
 async def test_require_evidence_mode_blocks_success_without_required_fields(monkeypatch: pytest.MonkeyPatch) -> None:
     class _MockClient:
         async def generate(self, req: ModelGenerateRequest) -> ModelGenerateResult:

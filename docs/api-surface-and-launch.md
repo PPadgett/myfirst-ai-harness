@@ -29,6 +29,12 @@ Both responses remain backward compatible and now include additive fields:
 
 Launch behavior still loads `harness.yaml` by default; now `route_manifest_path` is also used at startup to enable shared manifest/validator policy.
 
+Operational status entrypoint `Get-HarnessBackendStatus` now reports:
+
+- runtime plane health (`server` block: `/health`, `reachable`, `status_code`)
+- provider plane diagnostics (`provider_plane` and alias `backend` for compatibility: catalog reachability, status, model presence)
+- optional active session entries (`-IncludeSession`)
+
 ## Hardened security mode and rollout controls
 
 The repository keeps backward-compatible API payloads while layering hardening by feature flag:

@@ -35,6 +35,9 @@ from harness.types import ModelGenerateRequest
 from harness.validation import extract_first_json, validate_schema
 from harness.retrieval import DirectoryCorpusRetriever, RetrievedDoc, SimpleReranker, pack_context
 
+MODEL_BACKEND_UNAVAILABLE_CODE = "model_backend_unavailable"
+MODEL_REQUEST_FAILED_CODE = "model_request_failed"
+
 
 @dataclass
 class ModelArtifact:
@@ -78,6 +81,106 @@ class HarnessRuntime:
         self.last_run_id: str | None = None
         self.trace_id: str | None = None
         self._last_checkpoint_state: dict[str, Any] = {}
+
+    def _normalize_model_error(self, exc: BaseException) -> str:
+        text = str(exc).lower()
+        if MODEL_BACKEND_UNAVAILABLE_CODE in text:
+            return MODEL_BACKEND_UNAVAILABLE_CODE
+        if "model_request_failed" in text:
+            return MODEL_REQUEST_FAILED_CODE
+        if text.startswith("model_backend_unavailable"):
+            return MODEL_BACKEND_UNAVAILABLE_CODE
+        return MODEL_REQUEST_FAILED_CODE
+
+    def _backend_failure_response(
+        self,
+        request_id: str,
+        route: RoutePolicy,
+        model: str,
+        run_id: str,
+        validation_reason: str,
+        error_code: str,
+        stage: str,
+        *,
+        usage: dict[str, int] | None = None,
+        tool_calls: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        base = _build_openai_like_response(
+            request_id=request_id,
+            trace_id=self.trace_id,
+            model=model,
+            text=f"Backend request failed during {stage}.",
+            usage=usage or {"input_tokens": 0, "output_tokens": 0},
+            reasoning=None,
+            route=route,
+            policy_version=self.config.policy_version,
+            prompt_version=self.config.prompt_version,
+            evidence=[],
+            tool_plan="",
+        )
+        validation = {
+            "ok": False,
+            "missing_fields": ["model_output"],
+            "failed_route_ids": [route.route.value],
+            "error_codes": [error_code],
+        }
+        checkpoint_id = self.checkpoint_refs[-1] if self.checkpoint_refs else None
+        base.update(
+            {
+                "status": "validation_block",
+                "run_id": run_id,
+                "checkpoint_id": checkpoint_id,
+                "trace_checkpoint_count": len(self.checkpoint_refs),
+                "route": route.route.value,
+                "policy": route.as_dict(),
+                "evidence_ids": [],
+                "evidence": [],
+                "claims": [],
+                "validation": validation,
+                "tool_calls": tool_calls or [],
+                "next_action": "ask_clarification",
+                "guard": {
+                    "input": {"allow": True},
+                    "output": {"allow": False, "reason": validation_reason},
+                },
+                "parse": {"schema_valid": False, "errors": [validation_reason]},
+                "meta": {**base.get("meta", {}), "error_code": error_code, "backend_stage": stage},
+                "error_code": error_code,
+                "error": validation_reason,
+                "feature_level": self.feature_level,
+                "tool_sandbox_mode": self.tool_sandbox_mode,
+            }
+        )
+        latency_ms = 0
+        if usage is not None and isinstance(usage.get("input_tokens"), int):
+            # Keep shape compatibility with final response; exact latency is still computed by caller.
+            latency_ms = int(usage.get("input_tokens", 0) * 0 + usage.get("output_tokens", 0) * 0)
+        trace = TraceEvent(
+            request_id=request_id,
+            route=route.route.value,
+            model=model,
+            policy_version=self.config.policy_version,
+            prompt_version=self.config.prompt_version,
+            status="validation_block",
+            latency_ms=latency_ms,
+            stages=[{"stage": stage, "status": "failed", "error_code": error_code}],
+            checkpoints=self._load_checkpoint_payloads(),
+            state_diffs={
+                "checkpoint_count": len(self.checkpoint_refs),
+                "latest_phase": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
+                "latest_state_diffs": {},
+            },
+            request=redact_sensitive_args({"route": route.as_dict(), "error_code": error_code}),
+            result_summary={
+                "status": "validation_block",
+                "usage": usage or {},
+                "validation": validation,
+                "tool_calls": len(tool_calls or []),
+            },
+        )
+        self.trace_store.write(trace)
+        return base
+
 
     async def process(self, request: dict[str, Any]) -> dict[str, Any]:
         start = time.perf_counter()
@@ -299,7 +402,30 @@ class HarnessRuntime:
                 tools=specs_as_openai_tools(route.allowed_tools),
                 allow_reasoning=False,
             )
-            tool_plan_res = await self.model_client.generate(tool_plan_req)
+            try:
+                tool_plan_res = await self.model_client.generate(tool_plan_req)
+            except RuntimeError as exc:
+                error_code = self._normalize_model_error(exc)
+                self._checkpoint(
+                    phase="tool_plan",
+                    run_id=run_id,
+                    attempt=1,
+                    route_id=route.route.value,
+                    status="failed",
+                    error_code=error_code,
+                    payload={"error": str(exc)},
+                )
+                return self._backend_failure_response(
+                    request_id=request_id,
+                    route=route,
+                    model=model,
+                    run_id=run_id,
+                    validation_reason=str(exc),
+                    error_code=error_code,
+                    stage="tool_plan",
+                    tool_calls=[],
+                )
+
             stage_events.append({"stage": "tool_plan", "model_usage": tool_plan_res.usage})
             usage = _accumulate_usage(usage, tool_plan_res.usage)
             parsed_plan_ok, parsed_plan, parse_reason = extract_first_json(tool_plan_res.text)
@@ -474,7 +600,31 @@ class HarnessRuntime:
             allow_reasoning=route.allow_reasoning,
             reasoning_budget_tokens=_budget_tokens(route.thinking_budget),
         )
-        final_res = await self.model_client.generate(final_req)
+        try:
+            final_res = await self.model_client.generate(final_req)
+        except RuntimeError as exc:
+            error_code = self._normalize_model_error(exc)
+            self._checkpoint(
+                phase="final_generate",
+                run_id=run_id,
+                attempt=1,
+                route_id=route.route.value,
+                status="failed",
+                error_code=error_code,
+                payload={"error": str(exc), "tool_calls": [_tool_result_payload(r) for r in tool_results]},
+            )
+            return self._backend_failure_response(
+                request_id=request_id,
+                route=route,
+                model=model,
+                run_id=run_id,
+                validation_reason=str(exc),
+                error_code=error_code,
+                stage="final_generate",
+                tool_calls=[_tool_result_payload(r) for r in tool_results],
+                usage=usage,
+            )
+
         final_response_text = final_res.text
         final_reasoning = final_res.reasoning
         usage = _accumulate_usage(usage, final_res.usage)
@@ -494,16 +644,39 @@ class HarnessRuntime:
                             "content": "Previous answer malformed. Return strict JSON for schema only.",
                         }
                     ]
-                    repair_res = await self.model_client.generate(
-                        ModelGenerateRequest(
-                            model=model,
-                            messages=repair_request,
-                            temperature=0.0,
-                            max_new_tokens=256,
-                            response_schema=final_schema,
-                            allow_reasoning=False,
+                    try:
+                        repair_res = await self.model_client.generate(
+                            ModelGenerateRequest(
+                                model=model,
+                                messages=repair_request,
+                                temperature=0.0,
+                                max_new_tokens=256,
+                                response_schema=final_schema,
+                                allow_reasoning=False,
+                            )
                         )
-                    )
+                    except RuntimeError as exc:
+                        error_code = self._normalize_model_error(exc)
+                        self._checkpoint(
+                            phase="repair",
+                            run_id=run_id,
+                            attempt=1,
+                            route_id=route.route.value,
+                            status="failed",
+                            error_code=error_code,
+                            payload={"error": str(exc)},
+                        )
+                        return self._backend_failure_response(
+                            request_id=request_id,
+                            route=route,
+                            model=model,
+                            run_id=run_id,
+                            validation_reason=str(exc),
+                            error_code=error_code,
+                            stage="repair",
+                            tool_calls=[_tool_result_payload(r) for r in tool_results],
+                            usage=usage,
+                        )
                     parse_ok, parsed_payload = _parse_and_validate(repair_res.text, final_schema)
                     final_response_text = repair_res.text if parse_ok else final_response_text
                     schema_valid = parse_ok

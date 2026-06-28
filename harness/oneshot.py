@@ -14,6 +14,74 @@ DEFAULT_CONFIG_PATH = "harness.yaml"
 _BAD_EXPLICIT_MODELS = {
     "hf://meta-llama/Llama-3.1-8B-Instruct",
 }
+MODEL_BACKEND_UNAVAILABLE_CODE = "model_backend_unavailable"
+MODEL_CATALOG_UNAVAILABLE_CODE = "model_catalog_unavailable"
+MODEL_CATALOG_PARSE_CODE = "model_catalog_parse_failed"
+MODEL_CATALOG_MISSING_MODEL_CODE = "model_not_available"
+
+
+class RuntimeBackendError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        config_path: str,
+        backend_url: str,
+        expected_model: str | None,
+    ) -> None:
+        self.code = code
+        self.config_path = config_path
+        self.backend_url = backend_url
+        self.expected_model = expected_model
+        self.message = message
+        super().__init__(
+            f"{message} | error_code={code} | config_path={config_path} | backend_url={backend_url}"
+            + (f" | expected_model={expected_model}" if expected_model else "")
+        )
+
+
+def runtime_backend_context(config_path: str | None = None) -> dict[str, str]:
+    config_path = config_path or DEFAULT_CONFIG_PATH
+    runtime = load_runtime_config(None if config_path == DEFAULT_CONFIG_PATH else config_path)
+    return {
+        "config_path": config_path,
+        "backend_name": runtime.backend.name,
+        "backend_url": runtime.backend.base_url.rstrip("/"),
+        "resolved_model": str(runtime.model),
+    }
+
+
+def _normalize_model_name(value: str) -> str:
+    return value.strip().lower().replace(" ", "")
+
+
+def _extract_model_names(payload: Any) -> list[str]:
+    candidates: Any = payload
+    if isinstance(payload, dict):
+        for key in ("data", "models"):
+            nested = payload.get(key)
+            if isinstance(nested, list):
+                candidates = nested
+                break
+
+    if not isinstance(candidates, list):
+        return []
+
+    names: list[str] = []
+    for item in candidates:
+        if isinstance(item, str):
+            name = item.strip()
+            if name:
+                names.append(name)
+            continue
+        if isinstance(item, dict):
+            for key in ("id", "name", "model"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    names.append(value.strip())
+                    break
+    return names
 
 
 def validate_model_override(model: str | None) -> str | None:
@@ -31,6 +99,99 @@ def validate_model_override(model: str | None) -> str | None:
         )
 
     return normalized
+
+
+def validate_runtime_backend(
+    config_path: str | None = None,
+    *,
+    timeout_seconds: float = 2.0,
+    expected_model: str | None = None,
+    skip_backend_check: bool = False,
+) -> None:
+    config_path = config_path or DEFAULT_CONFIG_PATH
+    if skip_backend_check:
+        return
+
+    runtime = load_runtime_config(None if config_path == DEFAULT_CONFIG_PATH else config_path)
+    backend_name = str(runtime.backend.name).strip().lower()
+    allowed_backends = {"openai", "ollama", "nvidia_nim", "auto"}
+    if backend_name not in allowed_backends:
+        raise RuntimeError(
+            f"Unsupported backend '{backend_name}'. Supported backends: {', '.join(sorted(allowed_backends))}."
+        )
+
+    normalized_base_url = runtime.backend.base_url.rstrip("/")
+    if normalized_base_url.endswith("/v1"):
+        models_url = f"{normalized_base_url}/models"
+    else:
+        models_url = f"{normalized_base_url}/v1/models"
+
+    normalized_expected = None
+    if expected_model is not None:
+        normalized_expected = str(expected_model)
+
+    try:
+        response = httpx.get(models_url, timeout=timeout_seconds)
+    except httpx.RequestError as exc:
+        raise RuntimeError(
+            str(
+                RuntimeBackendError(
+                    MODEL_BACKEND_UNAVAILABLE_CODE,
+                    f"Model backend is unavailable at {models_url}",
+                    config_path=config_path,
+                    backend_url=models_url,
+                    expected_model=normalized_expected,
+                )
+            )
+        ) from exc
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            str(
+                RuntimeBackendError(
+                    MODEL_CATALOG_UNAVAILABLE_CODE,
+                    f"Model backend catalog check failed at {models_url} with status {response.status_code}",
+                    config_path=config_path,
+                    backend_url=models_url,
+                    expected_model=normalized_expected,
+                )
+            )
+        )
+
+    if not expected_model:
+        return
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            str(
+                RuntimeBackendError(
+                    MODEL_CATALOG_PARSE_CODE,
+                    f"Model backend catalog response at {models_url} was not valid JSON",
+                    config_path=config_path,
+                    backend_url=models_url,
+                    expected_model=normalized_expected,
+                )
+            )
+        ) from exc
+
+    model_names = _extract_model_names(payload)
+    normalized_expected = _normalize_model_name(expected_model)
+
+    normalized_catalog = {_normalize_model_name(name) for name in model_names}
+    if normalized_expected not in normalized_catalog:
+        raise RuntimeError(
+            str(
+                RuntimeBackendError(
+                    MODEL_CATALOG_MISSING_MODEL_CODE,
+                    f"Model '{expected_model}' is not available in catalog at {models_url}",
+                    config_path=config_path,
+                    backend_url=models_url,
+                    expected_model=expected_model,
+                )
+            )
+        )
 
 
 def resolve_model(config_path: str | None, explicit_model: str | None) -> str:
