@@ -19,6 +19,13 @@ tool_allowlist:
   - "time_now"
   - "new_uuid"
 
+# Shared route policy + validator manifest for parity with the demo engine.
+route_manifest_path: "real_harness_routes.yaml"
+
+# Optional rollout controls
+feature_level: "basic"
+require_evidence: false
+
 # NVIDIA NIM example (set backend: nvidia_nim and point base_url to your local NIM container)
 # backend:
 #   name: nvidia_nim

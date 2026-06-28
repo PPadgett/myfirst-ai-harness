@@ -1,22 +1,39 @@
+"""Production runtime orchestration for the local harness."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from dataclasses import dataclass
-from typing import Any
-import hashlib
 import json
+import shutil
+import os
+import subprocess
 import time
 import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 from harness.adapters.base import BaseModelClient
 from harness.config import RuntimeConfig
-from harness.guards import GuardDecision, check_input_text, check_output_text
-from harness.retrieval import DirectoryCorpusRetriever, RetrievedDoc, SimpleReranker, pack_context
+from harness.manifest_schema import load_route_manifest
+from harness.evidence import Claim
+from harness.execution_state import write_checkpoint
+from harness.guards import (
+    GuardDecision,
+    check_input_text,
+    check_output_text,
+    check_tool_output,
+    check_tool_request_with_tool,
+    sanitize_text,
+    split_trusted_untrusted,
+    redact_sensitive_args,
+)
 from harness.router import RoutePolicy, Route, classify_route
 from harness.tools import ToolCallResult, execute_tool, specs_as_openai_tools
 from harness.trace_cache import ResponseCache, TraceEvent, TraceStore
-from harness.types import ModelGenerateRequest, ModelGenerateResult
+from harness.types import ModelGenerateRequest
 from harness.validation import extract_first_json, validate_schema
+from harness.retrieval import DirectoryCorpusRetriever, RetrievedDoc, SimpleReranker, pack_context
 
 
 @dataclass
@@ -24,7 +41,6 @@ class ModelArtifact:
     trace_id: str
     request_id: str
     route: RoutePolicy
-    policy: dict[str, Any]
     retrieved_doc_ids: list[str]
     tool_calls: list[dict[str, Any]]
     prompt_payload: list[dict[str, str]]
@@ -46,147 +62,414 @@ class HarnessRuntime:
         self.reranker = SimpleReranker()
         self.trace_store = TraceStore(config.trace_dir)
         self.cache = ResponseCache(config.cache_dir, config.max_cache_entries) if config.enable_cache else None
+        self.state_dir = Path(config.state_dir)
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.feature_level = (config.feature_level or "basic").lower()
+        self.route_manifests = load_route_manifest(
+            str(config.route_manifest_path),
+            strict=self.feature_level == "hardening",
+        )
+        self.require_evidence = bool(config.require_evidence)
+        self.route_overrides = config.route_overrides
+        self.tool_sandbox_mode = os.getenv("HARNESS_TOOL_SANDBOX", "off").lower()
+        self.sandbox_image = os.getenv("HARNESS_TOOL_SANDBOX_IMAGE", "python:3.12-slim")
+        self.sandbox_timeout = int(os.getenv("HARNESS_TOOL_SANDBOX_TIMEOUT", "120"))
+        self.checkpoint_refs: list[str] = []
+        self.last_run_id: str | None = None
+        self.trace_id: str | None = None
+        self._last_checkpoint_state: dict[str, Any] = {}
 
     async def process(self, request: dict[str, Any]) -> dict[str, Any]:
         start = time.perf_counter()
-        request_id = request.get("request_id") or str(uuid.uuid4())
-        trace_id = str(uuid.uuid4())
+        feature_level = (self.config.feature_level or "basic").lower()
+        if feature_level != self.feature_level:
+            self.feature_level = feature_level
+            self.route_manifests = load_route_manifest(
+                str(self.config.route_manifest_path),
+                strict=self.feature_level == "hardening",
+            )
+        self.require_evidence = bool(self.config.require_evidence)
+        self.route_overrides = self.config.route_overrides
         messages = request.get("messages", [])
+        request_id = request.get("request_id") or str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+        self.last_run_id = run_id
+        self.trace_id = str(uuid.uuid4())
+        self._last_checkpoint_state = {}
         model = request.get("model", self.config.model)
         response_schema = request.get("response_schema")
         route_override = request.get("route")
-        user_safety_profile = request.get("safety_profile", "default")
-        route = classify_route(messages, response_schema=response_schema, route_override=route_override)
+        self.checkpoint_refs = []
+
+        raw_user_text = _last_user_text(messages)
+        trusted_input, untrusted_input = split_trusted_untrusted(raw_user_text)
+        user_text = sanitize_text(untrusted_input or trusted_input)
+        route_manifest_payload: dict[str, Any] = {
+            rid: (route.model_dump() if hasattr(route, "model_dump") else route)
+            for rid, route in self.route_manifests.items()
+        }
+        route = classify_route(
+            messages,
+            response_schema=response_schema,
+            route_override=route_override,
+            route_manifest=route_manifest_payload,
+            route_overrides=self.route_overrides,
+            feature_level=self.feature_level,
+            advanced_router_enabled=self.config.advanced_router_enabled,
+        )
+
+        self._checkpoint(
+            phase="routing",
+            run_id=run_id,
+            attempt=1,
+            route_id=route.route.value,
+            status="ok",
+            payload={"route": route.route.value, "confidence": route.confidence},
+        )
+
+        if route.next_action == "ask_clarification":
+            validation = {"ok": False, "missing_fields": ["route_confidence"], "failed_route_ids": [route.route.value]}
+            response = _build_openai_like_response(
+                request_id=request_id,
+                trace_id=self.trace_id,
+                model=model,
+                text="I need additional clarification before proceeding.",
+                usage={"input_tokens": 0, "output_tokens": 0},
+                reasoning=None,
+                route=route,
+                policy_version=self.config.policy_version,
+                prompt_version=self.config.prompt_version,
+                evidence=[],
+                tool_plan="",
+            )
+            self._checkpoint(
+                phase="validation",
+                run_id=run_id,
+                attempt=1,
+                route_id=route.route.value,
+                status="blocked",
+                error_code="low_confidence",
+                payload={"validation": validation, "next_action": "ask_clarification"},
+            )
+            response.update(
+                {
+                    "status": "validation_block",
+                    "route": route.route.value,
+                    "next_action": "ask_clarification",
+                    "validation": validation,
+                    "trace_checkpoint_count": len(self.checkpoint_refs),
+                    "checkpoint_id": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
+                    "evidence": [],
+                    "claims": [],
+                    "trace": [],
+                }
+            )
+            self.trace_store.write(
+                TraceEvent(
+                    request_id=request_id,
+                    route=route.route.value,
+                    model=model,
+                    policy_version=self.config.policy_version,
+                    prompt_version=self.config.prompt_version,
+                    status=response["status"],
+                    latency_ms=int((time.perf_counter() - start) * 1000),
+                    stages=[],
+                    checkpoints=self._load_checkpoint_payloads(),
+                    request=redact_sensitive_args({"messages": [{"role": "user", "content": raw_user_text}], "model": model, "route": route.route.value}),
+                    result_summary={"status": response["status"], "validation": validation},
+                )
+            )
+            return response
+
+        input_decision = check_input_text(user_text)
+        if not input_decision.allow:
+            return _error_payload(
+                self.trace_id,
+                request_id,
+                model,
+                route,
+                input_decision,
+                {"reason": input_decision.reason},
+            )
+
+        if self.require_evidence:
+            self._checkpoint(
+                phase="input_guard",
+                run_id=run_id,
+                attempt=1,
+                route_id=route.route.value,
+                status="ok",
+                payload={"decision": "passed"},
+            )
+
+        # Policy hooks from route class.
         model_name = str(model).lower()
         if any(prefix in model_name for prefix in self.config.thinking_model_prefixes):
             route.allow_reasoning = True
             if route.thinking_budget == "low":
                 route.thinking_budget = "medium"
 
-        # input guard
-        user_text = _last_user_text(messages)
-        input_decision = check_input_text(user_text)
-        if not input_decision.allow:
-            return _error_payload(trace_id, request_id, model, route, input_decision, {})
+        requested_toolset = request.get("toolset")
+        if isinstance(requested_toolset, list):
+            requested_tools = tuple(sorted({str(x) for x in requested_toolset if isinstance(x, str)}))
+            if requested_tools:
+                allowed_by_request = [tool for tool in route.allowed_tools if tool in requested_tools]
+                route.allowed_tools = tuple(allowed_by_request)
 
-        # cache key excludes tool outputs and final response
-        cache_hit = None
+        # Global tool allowlist.
+        route.allowed_tools = tuple(
+            tool for tool in route.allowed_tools if tool in self.config.tool_allowlist
+        )
+        if not route.allowed_tools:
+            route.use_tools = False
+
+        # Cache key excludes volatile outputs.
         cache_key_payload = {
             "model": model,
             "messages": messages,
             "policy": route.as_dict(),
             "schema": response_schema,
-            "safety_profile": user_safety_profile,
+            "safety_profile": request.get("safety_profile", "default"),
+            "route_override": route_override,
+            "run_id": run_id,
+            "toolset": requested_toolset or [],
         }
-        requested_toolset = request.get("toolset")
-        if isinstance(requested_toolset, list):
-            requested_tools = tuple(sorted({str(x) for x in requested_toolset if isinstance(x, str)}))
-            if requested_tools:
-                route.allowed_tools = tuple(t for t in route.allowed_tools if t in requested_tools)
 
-        # merge route and user constraints for cache key
-        cache_key_payload["policy"]["allowed_tools"] = list(route.allowed_tools)
+        cache_hit = None
         if self.cache is not None:
             cache_hit = self.cache.get(cache_key_payload)
-        if cache_hit is not None:
-            cache_hit["id"] = f"ch_{cache_hit.get('id', request_id)}"
-            cache_hit["cached"] = True
-            cache_hit["trace_id"] = trace_id
-            return cache_hit
+            if cache_hit is not None:
+                cache_hit = dict(cache_hit)
+                cache_hit["id"] = f"ch_{cache_hit.get('id', request_id)}"
+                cache_hit["cached"] = True
+                cache_hit["trace_id"] = self.trace_id
+                cache_hit["run_id"] = run_id
+                cache_hit["checkpoint_id"] = None
+                cache_hit["validation"] = {"ok": True, "missing_fields": [], "failed_route_ids": []}
+                cache_hit["status"] = str(cache_hit.get("status") or "ok")
+                cache_hit["next_action"] = "report"
+                cache_hit["route"] = route.route.value
+                cache_hit["trace_checkpoint_count"] = 0
+                return cache_hit
 
-        requested_temp = float(request.get("temperature", route.temperature))
         requested_max_tokens = int(request.get("max_tokens", route.max_new_tokens))
-        if requested_temp < 0:
-            requested_temp = 0.0
-        if requested_temp > 2:
-            requested_temp = 2.0
+        requested_temp = float(request.get("temperature", route.temperature))
+        requested_temp = min(2.0, max(0.0, requested_temp))
+        requested_max_tokens = max(64, requested_max_tokens)
 
-        if requested_max_tokens < 64:
-            requested_max_tokens = 64
-        evidence_ids: list[str] = []
+        tool_attempts = 0
+        stage_events: list[dict[str, Any]] = []
+        usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+        parsed_payload: dict[str, Any] | None = None
+
         docs: list[RetrievedDoc] = []
+        evidence_ids: list[str] = []
         if route.use_retrieval:
             docs = self.retriever.search(user_text, k=24)
             docs = self.reranker.rank(query=user_text, docs=docs, k=6)
             docs = pack_context(docs, max_tokens=1500)
-            evidence_ids = [d.doc_id for d in docs]
+            evidence_ids = [doc.doc_id for doc in docs]
 
-        stage_events = []
-        tool_results: list[ToolCallResult] = []
-        prompt_messages = _build_system_prompt(route, evidence_ids, [d.text[:900] for d in docs])
+        self._checkpoint(
+            phase="retrieval",
+            run_id=run_id,
+            attempt=1,
+            route_id=route.route.value,
+            status="ok",
+            payload={"count": len(docs)},
+        )
+
+        prompt_messages = _build_system_prompt(route, evidence_ids, [doc.text[:900] for doc in docs])
         prompt_messages.extend(messages)
 
-        tool_attempts = 0
-        final_response_text = ""
-        final_reasoning = None
-        usage = {"input_tokens": 0, "output_tokens": 0}
-
-        if route.use_tools and tool_attempts < route.max_model_calls:
+        tool_results: list[ToolCallResult] = []
+        tool_plan_answer = ""
+        if route.use_tools and route.allowed_tools and tool_attempts < route.max_tool_calls_per_turn:
             tool_prompt = prompt_messages.copy()
             tool_prompt.append(
-                {
-                    "role": "assistant",
-                    "content": _tool_planner_instruction(route.allowed_tools),
-                }
+                {"role": "assistant", "content": _tool_planner_instruction(route.allowed_tools)},
             )
-            tool_request_schema = _tool_schema(route.allowed_tools)
+            tool_plan_schema = _tool_schema(route.allowed_tools)
             tool_plan_req = ModelGenerateRequest(
                 model=model,
                 messages=tool_prompt,
                 temperature=min(0.2, requested_temp),
                 max_new_tokens=min(512, max(128, requested_max_tokens // 4)),
-                response_schema=tool_request_schema,
+                response_schema=tool_plan_schema,
                 tools=specs_as_openai_tools(route.allowed_tools),
+                allow_reasoning=False,
             )
             tool_plan_res = await self.model_client.generate(tool_plan_req)
             stage_events.append({"stage": "tool_plan", "model_usage": tool_plan_res.usage})
             usage = _accumulate_usage(usage, tool_plan_res.usage)
+            parsed_plan_ok, parsed_plan, parse_reason = extract_first_json(tool_plan_res.text)
+            tool_plan_answer = tool_plan_res.text or ""
+            self._checkpoint(
+                phase="tool_plan",
+                run_id=run_id,
+                attempt=1,
+                route_id=route.route.value,
+                status="ok" if parsed_plan_ok else "parse_fail",
+                error_code=None if parsed_plan_ok else f"tool_plan_parse_failed:{parse_reason}",
+                payload={"plan": parsed_plan if isinstance(parsed_plan, dict) else None},
+            )
 
-            parsed_plan_ok, parsed_plan, _ = extract_first_json(tool_plan_res.text)
-            tool_calls: list[dict[str, Any]] = []
+            planned_calls: list[dict[str, Any]] = []
             if parsed_plan_ok and isinstance(parsed_plan, dict):
-                tool_calls = parsed_plan.get("tool_calls", [])
-            if tool_calls:
-                for item in tool_calls[: route.max_tool_calls_per_turn]:
-                    if not isinstance(item, dict):
-                        continue
-                    name = str(item.get("name", ""))
-                    args = item.get("arguments", {})
-                    if not isinstance(args, dict):
-                        args = {}
-                    if name not in route.allowed_tools:
-                        continue
-                    res = execute_tool(name, args)
-                    tool_results.append(res)
-                    tool_attempts += 1
+                planned_calls = parsed_plan.get("tool_calls", [])
 
-            if tool_results:
-                results_payload = [
-                    {
-                        "tool": t.name,
-                        "success": t.success,
-                        "arguments": t.args,
-                        "output": t.output,
-                        "error": t.error,
-                    }
-                    for t in tool_results
-                ]
-                prompt_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "Tool execution results: " + json.dumps(results_payload, ensure_ascii=False),
-                    }
+            if not isinstance(planned_calls, list):
+                planned_calls = []
+
+            allowed_tool_names = set(route.allowed_tools)
+            sandbox_tools = set(getattr(route, "tool_sandbox_required", ()))
+            planned_count = len(planned_calls)
+            for call in planned_calls:
+                if not isinstance(call, dict):
+                    continue
+                if route.max_tool_calls_per_turn > 0 and tool_attempts >= route.max_tool_calls_per_turn:
+                    break
+
+                name = str(call.get("name", "")).strip()
+                args = call.get("arguments", {})
+                if not isinstance(args, dict):
+                    args = {}
+                if name not in allowed_tool_names:
+                    tool_result = ToolCallResult(
+                        name=name,
+                        args=args if isinstance(args, dict) else {},
+                        output=None,
+                        success=False,
+                        error=f"Unknown tool: {name}",
+                        error_code="unknown_tool",
+                        started_at=datetime.now(timezone.utc).isoformat(),
+                        finished_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                else:
+                    gate = check_tool_request_with_tool(args, tool_name=name)
+                    if not gate.allow:
+                        tool_result = ToolCallResult(
+                            name=name,
+                            args=args if isinstance(args, dict) else {},
+                            output=None,
+                            success=False,
+                            error=gate.reason or "tool_request_blocked",
+                            error_code="tool_request_blocked",
+                            started_at=datetime.now(timezone.utc).isoformat(),
+                            finished_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                    else:
+                        if self.tool_sandbox_mode == "docker" and (name in sandbox_tools or name == "run_tests"):
+                            tool_result = _run_tool_in_sandbox(
+                                name,
+                                args,
+                                self.sandbox_image,
+                                self.sandbox_timeout,
+                            )
+                        else:
+                            tool_result = execute_tool(name, args)
+
+                        output_payload = (
+                            json.dumps(tool_result.output, ensure_ascii=False, default=str)
+                            if isinstance(tool_result.output, (dict, list))
+                            else str(tool_result.output)
+                        )
+                        if not check_tool_output(output_payload).allow:
+                            tool_result = ToolCallResult(
+                                name=tool_result.name,
+                                args=tool_result.args,
+                                output=tool_result.output,
+                                success=False,
+                                error="tool_output_blocked",
+                                error_code="tool_output_blocked",
+                                started_at=tool_result.started_at,
+                                finished_at=tool_result.finished_at or datetime.now(timezone.utc).isoformat(),
+                            )
+
+                tool_attempts += 1
+                tool_results.append(tool_result)
+                if not tool_result.success and route.hard_fail_errors:
+                    hard_fail = any(code in route.hard_fail_errors for code in [tool_result.error_code or ""])
+                    if hard_fail:
+                        break
+
+            budget_exhausted = (
+                route.max_tool_calls_per_turn > 0
+                and tool_attempts >= route.max_tool_calls_per_turn
+                and planned_count > tool_attempts
+            )
+            if budget_exhausted:
+                self._checkpoint(
+                    phase="tool_execution",
+                    run_id=run_id,
+                    attempt=1,
+                    route_id=route.route.value,
+                    status="tool_budget_exhausted",
+                    error_code="tool_calls_budget_exceeded",
+                    payload={
+                        "tool_calls": tool_attempts,
+                        "tool_calls_budget_exceeded": True,
+                        "branch": "tool_budget_guard",
+                        "max_tool_calls_per_turn": route.max_tool_calls_per_turn,
+                        "tool_plan_count": planned_count,
+                    },
                 )
+                tool_results.append(
+                    ToolCallResult(
+                        name="tool_budget_guard",
+                        args={},
+                        output={"branch": "tool_calls_budget_exceeded"},
+                        success=False,
+                        error="tool_calls_budget_exceeded",
+                        error_code="tool_calls_budget_exceeded",
+                        started_at=datetime.now(timezone.utc).isoformat(),
+                        finished_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+            else:
+                self._checkpoint(
+                    phase="tool_execution",
+                    run_id=run_id,
+                    attempt=1,
+                    route_id=route.route.value,
+                    status="ok" if all(result.success for result in tool_results) else "partial_fail",
+                    payload={
+                        "tool_calls": [_tool_result_payload(result) for result in tool_results],
+                        "tool_calls_budget_exceeded": False,
+                    },
+                )
+            prompt_messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Tool execution results: "
+                    + json.dumps([_tool_result_payload(r) for r in tool_results], ensure_ascii=False),
+                },
+            )
+        else:
+            self._checkpoint(
+                phase="tool_plan",
+                run_id=run_id,
+                attempt=1,
+                route_id=route.route.value,
+                status="skipped",
+                payload={"tool_calls": 0},
+            )
+            self._checkpoint(
+                phase="tool_execution",
+                run_id=run_id,
+                attempt=1,
+                route_id=route.route.value,
+                status="skipped",
+                payload={"tool_calls": 0},
+            )
 
-        final_msg_prompt = prompt_messages.copy()
         final_schema = response_schema if route.output_schema_required or route.strict_schema else None
-        final_temp = requested_temp if not route.strict_schema else min(0.2, requested_temp)
-        final_tokens = requested_max_tokens
+        final_msg_prompt = prompt_messages.copy()
         final_req = ModelGenerateRequest(
             model=model,
             messages=final_msg_prompt,
-            temperature=final_temp,
-            max_new_tokens=final_tokens,
+            temperature=requested_temp if not route.strict_schema else min(0.2, requested_temp),
+            max_new_tokens=requested_max_tokens,
             response_schema=final_schema,
             allow_reasoning=route.allow_reasoning,
             reasoning_budget_tokens=_budget_tokens(route.thinking_budget),
@@ -197,49 +480,84 @@ class HarnessRuntime:
         usage = _accumulate_usage(usage, final_res.usage)
         stage_events.append({"stage": "final_generate", "model_usage": final_res.usage, "reasoning": bool(final_reasoning)})
 
-        parsed = None
-        parse_errors: list[str] = []
-        schema_valid = False
-        parsed_ok = True
+        schema_valid = True
+        parse_error = []
         if final_schema is not None:
-            parsed_ok, parsed = _parse_and_validate(final_response_text, final_schema)
-            parse_errors = parsed.get("errors", []) if not parsed_ok else []
-            schema_valid = parsed_ok
-            if not parsed_ok:
-                repair_request_schema = {
-                    "type": "object",
-                    "properties": {
-                        "answer": {"type": "string"},
-                    },
-                    "required": ["answer"],
-                }
-                repair_msg = final_msg_prompt + [
-                    {"role": "assistant", "content": "Previous answer malformed. Return only strict JSON for schema and keep values simple."},
-                ]
-                repair_req = ModelGenerateRequest(
-                    model=model,
-                    messages=repair_msg,
-                    temperature=0.0,
-                    max_new_tokens=512,
-                    response_schema=repair_request_schema,
-                )
-                repair_res = await self.model_client.generate(repair_req)
-                parsed_ok, parsed = _parse_and_validate(repair_res.text, final_schema)
-                final_response_text = repair_res.text if parsed_ok else final_response_text
-                schema_valid = parsed_ok
-                usage = _accumulate_usage(usage, repair_res.usage)
-                stage_events.append({"stage": "repair_retry", "model_usage": repair_res.usage})
+            parse_ok, parsed_payload = _parse_and_validate(final_response_text, final_schema)
+            if not parse_ok:
+                schema_valid = False
+                parse_error = parsed_payload.get("errors", [])
+                if tool_plan_answer:
+                    repair_request = final_msg_prompt + [
+                        {
+                            "role": "assistant",
+                            "content": "Previous answer malformed. Return strict JSON for schema only.",
+                        }
+                    ]
+                    repair_res = await self.model_client.generate(
+                        ModelGenerateRequest(
+                            model=model,
+                            messages=repair_request,
+                            temperature=0.0,
+                            max_new_tokens=256,
+                            response_schema=final_schema,
+                            allow_reasoning=False,
+                        )
+                    )
+                    parse_ok, parsed_payload = _parse_and_validate(repair_res.text, final_schema)
+                    final_response_text = repair_res.text if parse_ok else final_response_text
+                    schema_valid = parse_ok
+                    usage = _accumulate_usage(usage, repair_res.usage)
+                    parse_error = parsed_payload.get("errors", []) if not parse_ok else []
+                    stage_events.append({"stage": "repair_retry", "model_usage": repair_res.usage})
+                    tool_plan_answer = tool_plan_answer or repair_res.text
 
-        output_decision = check_output_text(final_response_text)
-        if not output_decision.allow:
-            final_response_text = "I can’t provide that content under current output policy."
+        evidence_rows = _build_evidence_rows(
+            run_id=run_id,
+            route_id=route.route.value,
+            docs=docs,
+            tool_results=tool_results,
+            response=final_response_text,
+        )
+        evidence_ids_for_response = [row["evidence_id"] for row in evidence_rows]
+        tool_call_payloads = [_tool_result_payload(result) for result in tool_results]
+        validation = self._validate_route_evidence(route, tool_results, evidence_rows, parsed_payload)
 
-        status = "ok" if output_decision.allow and (not final_schema or schema_valid) else "validation_block"
+        evidence_required_failed = self.require_evidence and route.required_evidence_fields and not validation["ok"]
+        output_decision = GuardDecision(True, None)
+        if evidence_required_failed:
+            output_decision = GuardDecision(False, reason="required_evidence_missing")
+            final_response_text = "I cannot provide a validated response without required evidence."
+        else:
+            output_decision = check_output_text(final_response_text)
 
-        latency_ms = int((time.perf_counter() - start) * 1000)
+        status = (
+            "ok"
+            if output_decision.allow and schema_valid and validation["ok"] and not evidence_required_failed
+            else "validation_block"
+        )
+
+        claims = _build_claims(
+            run_id=run_id,
+            route_id=route.route.value,
+            response=final_response_text,
+            evidence_ids=evidence_ids_for_response,
+            valid=not validation["missing_fields"],
+            required_evidence=bool(route.required_evidence_fields),
+        )
+
+        self._checkpoint(
+            phase="validation",
+            run_id=run_id,
+            attempt=1,
+            route_id=route.route.value,
+            status="ok" if status == "ok" and schema_valid else "failed",
+            payload={"validation": validation, "output_allow": output_decision.allow},
+        )
+
         response = _build_openai_like_response(
             request_id=request_id,
-            trace_id=trace_id,
+            trace_id=self.trace_id,
             model=model,
             text=final_response_text,
             usage=usage,
@@ -247,26 +565,36 @@ class HarnessRuntime:
             route=route,
             policy_version=self.config.policy_version,
             prompt_version=self.config.prompt_version,
-            evidence=evidence_ids,
+            evidence=evidence_ids_for_response,
+            tool_plan=tool_plan_answer,
         )
+
+        latency_ms = int((time.perf_counter() - start) * 1000)
         response.update(
             {
                 "status": status,
+                "run_id": run_id,
+                "checkpoint_id": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
+                "trace_checkpoint_count": len(self.checkpoint_refs),
                 "route": route.route.value,
                 "policy": route.as_dict(),
-                "evidence_ids": evidence_ids,
-                "tool_calls": [r.__dict__ for r in tool_results],
-                "trace_id": trace_id,
-                "latency_ms": latency_ms,
-                "guard": {"input": input_decision.__dict__, "output": output_decision.__dict__},
-                "parse": {"schema_valid": schema_valid, "errors": parse_errors},
+                "evidence_ids": evidence_ids_for_response,
+                "evidence": evidence_rows,
+                "claims": [claim.to_dict() for claim in claims],
+                "validation": validation,
+                "tool_calls": tool_call_payloads,
+                "next_action": "report" if status == "ok" else "ask_clarification",
+                "guard": {"input": {"allow": True}, "output": {"allow": output_decision.allow, "reason": output_decision.reason}},
+                "parse": {"schema_valid": schema_valid, "errors": parse_error},
                 "stages": stage_events,
+                "feature_level": self.feature_level,
+                "tool_sandbox_mode": self.tool_sandbox_mode,
             }
         )
-        if parsed_ok and final_schema is not None:
-            response["parsed"] = parsed
+        if parsed_payload is not None and final_schema is not None:
+            response["parsed"] = parsed_payload
 
-        if self.cache is not None:
+        if self.cache is not None and status == "ok":
             self.cache.put(
                 cache_key_payload,
                 {
@@ -279,9 +607,14 @@ class HarnessRuntime:
                     "route": route.route.value,
                     "status": status,
                     "cached": False,
+                    "run_id": run_id,
+                    "checkpoint_id": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
+                    "validation": validation,
+                    "trace_checkpoint_count": len(self.checkpoint_refs),
                 },
             )
 
+        checkpoints_payload = self._load_checkpoint_payloads()
         trace = TraceEvent(
             request_id=request_id,
             route=route.route.value,
@@ -291,18 +624,179 @@ class HarnessRuntime:
             status=status,
             latency_ms=latency_ms,
             stages=stage_events,
-            request={"messages": messages, "model": model, "policy": route.as_dict(), "response_schema": response_schema},
-            result_summary={"status": status, "usage": usage, "evidence_ids": evidence_ids, "tool_calls": len(tool_results)},
+            checkpoints=checkpoints_payload,
+            state_diffs={
+                "checkpoint_count": len(checkpoints_payload),
+                "latest_phase": checkpoints_payload[-1].get("phase") if checkpoints_payload else None,
+                "latest_state_diffs": checkpoints_payload[-1].get("state_diffs") if checkpoints_payload else {},
+            },
+            request=redact_sensitive_args({"messages": messages, "model": model, "policy": route.as_dict(), "response_schema": response_schema}),
+            result_summary={
+                "status": status,
+                "usage": usage,
+                "evidence_ids": evidence_ids_for_response,
+                "tool_calls": len(tool_call_payloads),
+            },
         )
         self.trace_store.write(trace)
         return response
 
+    def _checkpoint(
+        self,
+        phase: str,
+        run_id: str,
+        attempt: int,
+        route_id: str,
+        status: str = "ok",
+        next_action: str | None = None,
+        error_code: str | None = None,
+        evidence_refs: list[str] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        safe_payload = redact_sensitive_args(payload or {})
+        safe_evidence_refs = list(evidence_refs or [])
+        current_state = self._snapshot_checkpoint_payload(
+            phase=phase,
+            route_id=route_id,
+            status=status,
+            next_action=next_action,
+            error_code=error_code,
+            evidence_refs=safe_evidence_refs,
+            payload=safe_payload,
+        )
+        state_diffs = self._payload_diff(self._last_checkpoint_state, current_state)
+        path = write_checkpoint(
+            out_dir=self.state_dir,
+            run_id=run_id,
+            attempt=attempt,
+            phase=phase,
+            route_id=route_id,
+            status=status,
+            next_action=next_action,
+            error_code=error_code,
+            evidence_refs=safe_evidence_refs,
+            route_metadata=redact_sensitive_args({"payload": safe_payload}),
+            state_diffs=state_diffs,
+            payload=safe_payload,
+        )
+        self._last_checkpoint_state = current_state
+        self.checkpoint_refs.append(path)
 
-def _last_user_text(messages: list[dict[str, str]]) -> str:
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            return str(msg.get("content", ""))
-    return ""
+    @staticmethod
+    def _snapshot_checkpoint_payload(
+        phase: str,
+        route_id: str,
+        status: str,
+        next_action: str | None,
+        error_code: str | None,
+        evidence_refs: list[str],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "phase": phase,
+            "route_id": route_id,
+            "status": status,
+            "next_action": next_action,
+            "error_code": error_code,
+            "evidence_refs": evidence_refs,
+            "payload": payload,
+        }
+
+    @staticmethod
+    def _payload_diff(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+        added: dict[str, Any] = {}
+        removed: list[str] = []
+        changed: dict[str, tuple[Any, Any]] = {}
+        for key, value in current.items():
+            if key not in previous:
+                added[key] = value
+            elif previous.get(key) != value:
+                changed[key] = (previous.get(key), value)
+        for key in previous:
+            if key not in current:
+                removed.append(key)
+        return {"added": added, "removed": removed, "changed": changed}
+
+    def _load_checkpoint_payloads(self) -> list[dict[str, Any]]:
+        payloads: list[dict[str, Any]] = []
+        for path in self.checkpoint_refs:
+            try:
+                with Path(path).open("r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                payloads.append(redact_sensitive_args(payload))
+        return payloads
+
+    def _validate_route_evidence(
+        self,
+        route: RoutePolicy,
+        tool_results: list[ToolCallResult],
+        evidence_rows: list[dict[str, Any]],
+        parsed: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        required = [str(item) for item in route.required_evidence_fields]
+        hard_fail_codes = {str(code).strip() for code in route.hard_fail_errors if isinstance(code, str)}
+        hard_fail_codes.add("unknown_tool")
+        failed_route = route.route.value
+        result: dict[str, Any] = {"ok": True, "missing_fields": [], "failed_route_ids": []}
+
+        tool_error_codes = [str(result.error_code or "") for result in tool_results if result.error_code]
+        error_codes = []
+        for code in tool_error_codes:
+            if code and code not in error_codes:
+                error_codes.append(code)
+        hard_fail_from_tools = any(code in hard_fail_codes for code in tool_error_codes)
+        if not required:
+            if hard_fail_from_tools:
+                return {
+                    "ok": False,
+                    "missing_fields": [],
+                    "failed_route_ids": [failed_route],
+                    "error_codes": error_codes,
+                }
+            result["error_codes"] = error_codes
+            return result
+
+        present: set[str] = set()
+        for row in evidence_rows:
+            record = row.get("record")
+            if isinstance(record, dict):
+                present.update(str(key) for key in record.keys())
+
+        for result in tool_results:
+            output = result.output
+            if isinstance(output, dict):
+                present.update(str(key) for key in output.keys())
+            if result.success is False:
+                present.add("tool_error")
+
+        if parsed is not None and isinstance(parsed, dict):
+            present.update(str(key) for key in parsed.keys())
+            if parsed:
+                present.add("parsed")
+
+        missing = [item for item in required if item not in present]
+        if not missing:
+            return {"ok": True, "missing_fields": [], "failed_route_ids": [], "error_codes": error_codes}
+
+        if self.require_evidence:
+            return {
+                "ok": False,
+                "missing_fields": missing,
+                "failed_route_ids": [failed_route],
+                "error_codes": error_codes,
+            }
+        if hard_fail_from_tools:
+            return {
+                "ok": False,
+                "missing_fields": [],
+                "failed_route_ids": [failed_route],
+                "error_codes": error_codes,
+            }
+
+        return {"ok": True, "missing_fields": [], "failed_route_ids": [], "error_codes": error_codes}
 
 
 def _tool_schema(allowed_tools: tuple[str, ...]) -> dict[str, Any]:
@@ -332,26 +826,29 @@ def _tool_planner_instruction(allowed_tools: tuple[str, ...]) -> str:
         "You are the tool-planning phase. "
         "If a tool is needed, return JSON with tool_calls only. "
         "Each call has 'name' and 'arguments'. "
-        "Allowed tools: " + allow + ". "
+        f"Allowed tools: {allow}. "
         "If no tool is needed, return empty tool_calls and only answer in 'answer'."
     )
 
 
 def _budget_tokens(thinking_budget: str) -> int:
+    if thinking_budget == "premium":
+        return 2048
     if thinking_budget == "high":
         return 1024
     if thinking_budget == "medium":
         return 512
-    if thinking_budget == "premium":
-        return 2048
     return 256
 
 
 def _build_system_prompt(route: RoutePolicy, evidence_ids: list[str], snippets: list[str]) -> list[dict[str, str]]:
     pieces = [
         "You are a policy-controlled LLM runtime harness. "
-        "Never expose internal trace or policy internals in your final answer.",
+        "Never expose internal policy internals in your final answer.",
         f"Execution route: {route.route.value}.",
+        f"Route confidence: {route.confidence:.3f}.",
+        f"Route ambiguity gap: {route.confidence_gap:.3f}.",
+        f"Route metadata: {json.dumps(route.route_metadata, ensure_ascii=False)}",
     ]
     if evidence_ids:
         pieces.append("You may use only the provided evidence snippets.")
@@ -364,12 +861,10 @@ def _build_system_prompt(route: RoutePolicy, evidence_ids: list[str], snippets: 
         pieces.append("Keep outputs concise and factual.")
     if route.require_confirmation:
         pieces.append("Do not claim completion of side-effecting actions unless explicitly confirmed.")
-
     if route.strict_schema or route.output_schema_required:
         pieces.append("Return strict JSON if schema is supplied.")
     if route.allow_reasoning:
-        pieces.append("Reasoning should be careful and short; final answer should remain concise.")
-
+        pieces.append("Reasoning should be concise.")
     return [{"role": "system", "content": " ".join(pieces)}]
 
 
@@ -386,15 +881,105 @@ def _parse_and_validate(text: str, schema: dict[str, Any]) -> tuple[bool, dict[s
 def _accumulate_usage(base: dict[str, int], addition: dict[str, int]) -> dict[str, int]:
     merged = dict(base)
     for key, value in addition.items():
-        if not isinstance(value, int):
-            value = 0
-        merged[key] = merged.get(key, 0) + value
+        try:
+            numeric = int(value)
+        except Exception:
+            numeric = 0
+        merged[key] = merged.get(key, 0) + numeric
     return merged
+
+
+def _tool_result_payload(res: ToolCallResult) -> dict[str, Any]:
+    safe_output = redact_sensitive_args(res.output)
+    safe_args = redact_sensitive_args(res.args)
+    return {
+        "name": res.name,
+        "tool": res.name,
+        "success": res.success,
+        "arguments": safe_args,
+        "output": safe_output,
+        "error": res.error,
+        "error_code": res.error_code,
+        "sandbox": res.sandbox,
+        "started_at": res.started_at,
+        "finished_at": res.finished_at,
+    }
+
+
+def _build_evidence_rows(
+    run_id: str,
+    route_id: str,
+    docs: list[RetrievedDoc],
+    tool_results: list[ToolCallResult],
+    response: str | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for index, doc in enumerate(docs):
+        rows.append(
+            {
+                "evidence_id": f"{run_id}-retrieval-{index}",
+                "route_id": route_id,
+                "source": "retrieval",
+                "record": redact_sensitive_args(
+                    {
+                        "doc_id": doc.doc_id,
+                        "text": doc.text[:1000],
+                        "score": doc.score,
+                        "metadata": doc.metadata,
+                    }
+                ),
+            }
+        )
+    for index, result in enumerate(tool_results):
+        result_payload = _tool_result_payload(result)
+        rows.append(
+            {
+                "evidence_id": f"{run_id}-tool-{index}",
+                "route_id": route_id,
+                "source": "tool",
+                "record": redact_sensitive_args(result_payload),
+                "tool": result.name,
+            }
+        )
+    if response is not None:
+        rows.append(
+            {
+                "evidence_id": f"{run_id}-response-final",
+                "route_id": route_id,
+                "source": "final_response",
+                "record": {
+                    "answer": redact_sensitive_args(
+                        response[:220] if isinstance(response, str) else str(response),
+                    ),
+                },
+            }
+        )
+    return rows
+
+
+def _build_claims(
+    run_id: str,
+    route_id: str,
+    response: str,
+    evidence_ids: list[str],
+    valid: bool,
+    required_evidence: bool,
+) -> list[Claim]:
+    status = "verified" if valid else "unverified"
+    claim_ids = [f"{run_id}-claim-0"]
+    claim = Claim(
+        claim_id=claim_ids[0],
+        route_id=route_id,
+        statement=redact_sensitive_args(response[:220]) if isinstance(response, str) else "",
+        evidence_ids=evidence_ids if required_evidence else [],
+        status=status,
+    )
+    return [claim]
 
 
 def _build_openai_like_response(
     request_id: str,
-    trace_id: str,
+    trace_id: str | None,
     model: str,
     text: str,
     usage: dict[str, int],
@@ -403,10 +988,13 @@ def _build_openai_like_response(
     policy_version: str,
     prompt_version: str,
     evidence: list[str],
+    tool_plan: str,
 ) -> dict[str, Any]:
     msg = {"role": "assistant", "content": text}
     if route.allow_reasoning and reasoning:
         msg["reasoning"] = reasoning
+    if tool_plan and route.use_tools:
+        msg["tool_plan"] = tool_plan
     return {
         "id": request_id,
         "object": "chat.completion",
@@ -424,6 +1012,9 @@ def _build_openai_like_response(
             "policy_version": policy_version,
             "prompt_version": prompt_version,
             "evidence_count": len(evidence),
+            "route_confidence": route.confidence,
+            "route_confidence_gap": route.confidence_gap,
+            "route_metadata": route.route_metadata,
         },
     }
 
@@ -446,6 +1037,145 @@ def _error_payload(
         "status": "blocked",
         "route": route.route.value,
         "trace_id": trace_id,
-        "guard": {"input": decision.__dict__, "output": {"allow": True}},
+        "next_action": "ask_clarification",
+        "guard": {"input": {"allow": decision.allow, "reason": decision.reason}, "output": {"allow": True}},
+        "evidence": [],
+        "claims": [],
+        "validation": {"ok": False, "missing_fields": [], "failed_route_ids": [route.route.value]},
         **extra,
     }
+
+
+def _truncate_text(value: str, max_len: int = 2000) -> str:
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 3] + "..."
+
+
+def _run_tool_in_sandbox(
+    name: str,
+    args: dict[str, Any],
+    image: str,
+    timeout_seconds: int,
+) -> ToolCallResult:
+    # Docker-backed sandbox path for declared heavy tools.
+    start = datetime.now(timezone.utc).isoformat()
+    if name != "run_tests":
+        return ToolCallResult(
+            name=name,
+            args=dict(args),
+            output={"sandbox_mode": "docker", "status": "unsupported_tool"},
+            success=False,
+            error="tool_sandbox_exec_error",
+            error_code="tool_sandbox_exec_error",
+            sandbox="docker",
+            started_at=start,
+            finished_at=start,
+        )
+
+    if shutil.which("docker") is None:
+        return ToolCallResult(
+            name=name,
+            args=dict(args),
+            output={"sandbox_mode": "docker", "status": "unavailable"},
+            success=False,
+            error="docker executable unavailable",
+            error_code="tool_sandbox_unavailable",
+            sandbox="docker",
+            started_at=start,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    scope = ""
+    raw_scope = args.get("scope")
+    if isinstance(raw_scope, str):
+        scope = raw_scope.strip()
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "-v",
+        f"{Path.cwd()}:/workspace",
+        "-w",
+        "/workspace",
+        image,
+        "pytest",
+    ]
+    if scope:
+        cmd.append(scope)
+    try:
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(5, timeout_seconds),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return ToolCallResult(
+            name=name,
+            args=dict(args),
+            output={
+                "sandbox_mode": "docker",
+                "status": "timeout",
+                "command": cmd,
+                "stdout": _truncate_text(str(exc.stdout or "")),
+                "stderr": _truncate_text(str(exc.stderr or "")),
+            },
+            success=False,
+            error="tool_sandbox_timeout",
+            error_code="tool_sandbox_timeout",
+            sandbox="docker",
+            started_at=start,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+    except OSError as exc:
+        return ToolCallResult(
+            name=name,
+            args=dict(args),
+            output={"sandbox_mode": "docker", "status": "exec_error", "error": str(exc)},
+            success=False,
+            error="tool_sandbox_exec_error",
+            error_code="tool_sandbox_exec_error",
+            sandbox="docker",
+            started_at=start,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+    payload = {
+        "sandbox_mode": "docker",
+        "command": cmd,
+        "returncode": proc.returncode,
+        "stdout": _truncate_text(proc.stdout or ""),
+        "stderr": _truncate_text(proc.stderr or ""),
+    }
+    if proc.returncode == 0:
+        return ToolCallResult(
+            name=name,
+            args=dict(args),
+            output=payload,
+            success=True,
+            error=None,
+            error_code=None,
+            sandbox="docker",
+            started_at=start,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            )
+    return ToolCallResult(
+        name=name,
+        args=dict(args),
+        output=payload,
+        success=False,
+        error="tool_return_nonzero",
+        error_code="tool_return_nonzero",
+        sandbox="docker",
+        started_at=start,
+        finished_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def _last_user_text(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return str(message.get("content", ""))
+    return ""

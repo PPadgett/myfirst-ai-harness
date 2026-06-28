@@ -7,6 +7,56 @@ This section documents the control and policy layer:
 - `harness/router.py`
 - `harness/runtime.py`
 
+## 0) Dual-track baseline and parity strategy
+
+This repo keeps two execution tracks:
+
+- `real_ai_harness.py` (demo engine): transparent phase trace and manifest-first routing.
+- `harness.runtime` (production engine): API-first policy runtime with persistence and checkpoints.
+
+Baseline tracking is tracked in:
+
+- `tests/fixtures/baseline/real_ai/queries.json`
+- `tests/fixtures/baseline/runtime/queries.json`
+
+Parity tooling:
+
+- `scripts/run_parity_sanity.py` checks route category/route confidence parity and mismatch signals across selected fixtures.
+- `tests/benchmarks/run_trace_regression.py` computes route-category and status/permission match rates.
+
+Current mismatch notes to preserve:
+
+- Real engine outputs include `trace_phase_count`; production uses `trace_checkpoint_count`.
+- Demo engine checkpoints are written under `state/` and include route-level checkpoint metadata.
+- Runtime checkpoints are written under `state/` and include normalized stage payloads.
+- Runtime output adds `tool_calls` and `feature_level` fields.
+
+## Hardened security mode and rollout controls
+
+- `HARNESS_FEATURE_LEVEL=basic|hardening` controls policy strictness.
+- `HARNESS_REQUIRE_EVIDENCE=0|1` gates fail-closed evidence enforcement.
+- `HARNESS_TOOL_SANDBOX=off|docker` controls isolated heavy-tool execution.
+- `HARNESS_ENABLE_ADVANCED_ROUTER=0|1` enables manifest-level threshold overrides and evidence requirements in router.
+- `HARNESS_ROUTE_OVERRIDES` (JSON object) / `runtime_config.route_overrides` can override route metadata for testing or staged rollout.
+- Route-specific sandbox and validator policy is resolved in this order:
+  1. manifest `validator` field (preferred),
+  2. legacy `manifests.validator_fields` compatibility fallback,
+  3. environment and override defaults.
+- The route override branch is currently loaded from:
+  `harness/config.py` (`load_runtime_config`), passed through `runtime.process()` as `route_overrides`, then merged in `harness/router.py` in `_resolve_route_metadata`.
+
+Compatibility branch note:
+
+- `validator` is always preferred when present.
+- `manifests.validator_fields` and `manifests.hard_fail_errors` are applied only if `validator` is absent.
+- In permissive mode invalid manifest entries are downgraded into best-effort route defaults.
+
+Rollback guidance:
+
+- If routing behavior regresses, set `HARNESS_ENABLE_ADVANCED_ROUTER=0`.
+- If evidence blocking is too strict, set `HARNESS_REQUIRE_EVIDENCE=0`.
+- If sandbox is unstable, set `HARNESS_TOOL_SANDBOX=off` and keep local execution policy.
+
 ## 1) `harness/config.py` — config resolution and backend normalization
 
 What it does:
@@ -72,6 +122,7 @@ How it works:
   8. low-risk tasks
   9. default direct route
 - For each route it returns a `RoutePolicy` with strict execution controls.
+- Route definitions prefer `validator` first and then fallback to `manifests.validator_fields` for compatibility.
 
 How to evolve this part (cutting-edge):
 
@@ -138,3 +189,25 @@ Related integration:
 - Adapters are injected into runtime and remain pluggable (`harness/adapters`).
 - Validation and safety logic is enforced through `validation.py` and `guards.py`.
 
+## Hardened security mode and rollout controls
+
+The dual-track architecture keeps one external API while allowing policy hardening to be staged:
+
+- `HARNESS_FEATURE_LEVEL=basic` (default) keeps permissive behavior while preserving compatibility.
+- `HARNESS_FEATURE_LEVEL=hardening` enables stricter confidence gating and evidence/fail-closed policy behavior.
+- `HARNESS_REQUIRE_EVIDENCE=1` makes grounded/tool routes fail-closed when required evidence is missing.
+- `HARNESS_TOOL_SANDBOX=off|docker` controls heavy-tool execution isolation.
+- `HARNESS_ENABLE_ADVANCED_ROUTER=1` enables manifest-driven threshold and route overrides.
+
+Rollback matrix:
+
+- routing drift: set `HARNESS_ENABLE_ADVANCED_ROUTER=0`
+- evidence regressions: set `HARNESS_REQUIRE_EVIDENCE=0`
+- sandbox instability: set `HARNESS_TOOL_SANDBOX=off`
+
+Parity checks now include:
+
+- route-category parity
+- `next_action` parity
+- permission-block behavior
+- evidence presence parity

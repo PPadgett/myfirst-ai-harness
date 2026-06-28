@@ -6,6 +6,7 @@ from typing import Any
 
 import os
 import yaml
+import json
 
 
 _BACKEND_ALIASES: dict[str, str] = {
@@ -44,12 +45,17 @@ class RuntimeConfig:
     corpus_dir: Path = Path("corpus")
     trace_dir: Path = Path("traces")
     cache_dir: Path = Path(".cache")
+    state_dir: Path = Path("state")
     enable_cache: bool = True
     max_cache_entries: int = 2000
     tool_allowlist: tuple[str, ...] = ("calculator", "time_now")
     model: str = "gpt-oss:latest"
     prompt_version: str = "2026.06.27-core"
     policy_version: str = "2026.06.27-policy-v1"
+    feature_level: str = "basic"
+    advanced_router_enabled: bool = False
+    route_manifest_path: str | None = None
+    require_evidence: bool = False
     thinking_model_prefixes: tuple[str, ...] = (
         "deepseek",
         "qwen2.5",
@@ -69,10 +75,15 @@ def _env(name: str, default: str) -> str:
     return os.getenv(name, default)
 
 
-def _to_bool(value: str, default: bool) -> bool:
+def _to_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
     if value == "":
         return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "on", "y"}
 
 
 def _to_str_dict(value: Any) -> dict[str, str] | None:
@@ -84,6 +95,26 @@ def _to_str_dict(value: Any) -> dict[str, str] | None:
             continue
         normalized[str(key)] = str(item)
     return normalized
+
+
+def _load_route_overrides(data: dict[str, Any]) -> dict[str, Any]:
+    route_overrides: dict[str, Any] = {}
+    configured = data.get("route_overrides", {})
+    if isinstance(configured, dict):
+        route_overrides.update(configured)
+
+    env_overrides = os.getenv("HARNESS_ROUTE_OVERRIDES")
+    if not env_overrides:
+        return route_overrides
+    try:
+        parsed = json.loads(env_overrides)
+    except Exception:
+        return route_overrides
+    if isinstance(parsed, dict):
+        merged = dict(route_overrides)
+        merged.update(parsed)
+        return merged
+    return route_overrides
 
 
 def _normalize_backend_name(raw_name: Any) -> str:
@@ -160,12 +191,21 @@ def load_runtime_config(path: str | None = None) -> RuntimeConfig:
         corpus_dir=Path(data.get("corpus_dir", _env("HARNESS_CORPUS", "corpus"))),
         trace_dir=Path(data.get("trace_dir", _env("HARNESS_TRACE_DIR", "traces"))),
         cache_dir=Path(data.get("cache_dir", _env("HARNESS_CACHE_DIR", ".cache"))),
+        state_dir=Path(data.get("state_dir", _env("HARNESS_STATE_DIR", "state"))),
         enable_cache=_to_bool(data.get("enable_cache", _env("HARNESS_CACHE", "true")), True),
         max_cache_entries=int(data.get("max_cache_entries", "2000")),
         tool_allowlist=tuple(data.get("tool_allowlist", ("calculator", "time_now"))),
         model=model,
         prompt_version=data.get("prompt_version", _env("HARNESS_PROMPT_VERSION", "2026.06.27-core")),
         policy_version=data.get("policy_version", _env("HARNESS_POLICY_VERSION", "2026.06.27-policy-v1")),
+        feature_level=data.get("feature_level", _env("HARNESS_FEATURE_LEVEL", "basic")),
+        advanced_router_enabled=_to_bool(data.get("advanced_router", _env("HARNESS_ENABLE_ADVANCED_ROUTER", "0")), False),
+        route_manifest_path=data.get(
+            "route_manifest_path",
+            _env("HARNESS_ROUTE_MANIFEST", "real_harness_routes.yaml"),
+        )
+        or "real_harness_routes.yaml",
+        require_evidence=_to_bool(data.get("require_evidence", _env("HARNESS_REQUIRE_EVIDENCE", "false")), False),
         thinking_model_prefixes=tuple(data.get("thinking_model_prefixes", (
             "deepseek",
             "qwen2.5",
@@ -175,6 +215,6 @@ def load_runtime_config(path: str | None = None) -> RuntimeConfig:
             "mistral-large",
             "granite3.2",
         ))),
-        route_overrides=data.get("route_overrides", {}),
+        route_overrides=_load_route_overrides(data),
     )
     return runtime

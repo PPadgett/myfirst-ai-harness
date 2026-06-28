@@ -23,15 +23,26 @@ import math
 import os
 import re
 import subprocess
-import sys
+import shutil
+from pathlib import Path
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import yaml
+from harness.tools import execute_tool
+from harness.evidence import Claim
+from harness.guards import (
+    check_input_text,
+    check_tool_output,
+    check_tool_request_with_tool,
+    sanitize_text,
+    split_trusted_untrusted,
+    redact_sensitive_args,
+)
 
 
 HELP_TEXT = """
@@ -212,6 +223,47 @@ class RealHarnessEngine:
             "inspect_query",
             explanation="Runtime is ready and moves to inspect_query.",
         )
+        self.state_dir = Path(os.getenv("HARNESS_STATE_DIR", "state"))
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.tool_sandbox_mode = os.getenv("HARNESS_TOOL_SANDBOX", "off").lower()
+        self.sandbox_image = os.getenv("HARNESS_TOOL_SANDBOX_IMAGE", "python:3.12-slim")
+        self.sandbox_timeout = int(os.getenv("HARNESS_TOOL_SANDBOX_TIMEOUT", "120"))
+        self.require_evidence = os.getenv("HARNESS_REQUIRE_EVIDENCE", "0") in {"1", "true", "TRUE", "yes", "on"}
+        self.feature_level = os.getenv("HARNESS_FEATURE_LEVEL", "basic").lower()
+        self.checkpoint_files: list[str] = []
+        self.current_run_id: str | None = None
+
+    def _checkpoint(
+        self,
+        phase: str,
+        run_id: str,
+        route_id: str,
+        attempt: int,
+        status: str = "ok",
+        next_action: str | None = None,
+        error_code: str | None = None,
+        evidence_refs: list[str] | None = None,
+        payload: Any = None,
+        route_metadata: dict[str, Any] | None = None,
+    ) -> str:
+        timestamp = datetime.now(timezone.utc).isoformat()
+        filename = f"{run_id}-a{attempt}-{phase}.json"
+        target = self.state_dir / filename
+        entry = {
+            "phase": phase,
+            "route_id": route_id,
+            "attempt": attempt,
+            "status": status,
+            "next_action": next_action,
+            "error_code": error_code,
+            "evidence_refs": evidence_refs or [],
+            "timestamp": timestamp,
+            "route_metadata": redact_sensitive_args(route_metadata or {}),
+            "payload": redact_sensitive_args(payload or {}),
+        }
+        target.write_text(json.dumps(entry, indent=2), encoding="utf-8")
+        self.checkpoint_files.append(str(target))
+        return str(target)
 
     @staticmethod
     def _load_manifest(path: str) -> Dict[str, Any]:
@@ -272,6 +324,144 @@ class RealHarnessEngine:
             return parsed if isinstance(parsed, dict) else None
         except Exception:
             return None
+
+    def _run_id(self) -> str:
+        if not self.current_run_id:
+            self.current_run_id = str(uuid.uuid4())
+        return self.current_run_id
+
+    def _build_evidence_rows(
+        self,
+        route_id: str,
+        final_response: str,
+        tool_outputs: List[Dict[str, Any]],
+    ) -> list[Dict[str, Any]]:
+        run_id = self._run_id()
+        evidence_rows: list[Dict[str, Any]] = []
+        for index, output in enumerate(tool_outputs):
+            evidence_rows.append(
+                {
+                    "evidence_id": f"{run_id}-tool-{index}",
+                    "route_id": route_id,
+                    "source": "tool",
+                    "record": redact_sensitive_args(output),
+                }
+            )
+        evidence_rows.append(
+            {
+                "evidence_id": f"{run_id}-final",
+                "route_id": route_id,
+                "source": "final_response",
+                "record": {
+                    "final_response": redact_sensitive_args(final_response),
+                    "answer": redact_sensitive_args(final_response),
+                },
+            }
+        )
+        return evidence_rows
+
+    def _build_claims(self, route_id: str, final_response: str, evidence: list[Dict[str, Any]], valid: bool) -> list[dict[str, Any]]:
+        evidence_ids = [row["evidence_id"] for row in evidence]
+        if not evidence_ids:
+            evidence_ids = []
+        claim = Claim(
+            claim_id=f"{self._run_id()}-claim-0",
+            route_id=route_id,
+            statement=redact_sensitive_args(str(final_response)[:260] if isinstance(final_response, str) else str(final_response)),
+            evidence_ids=evidence_ids if valid and self.require_evidence else [],
+            status="verified" if valid else "unverified",
+        )
+        return [claim.to_dict()]
+
+    def _common_response_meta(self) -> dict[str, Any]:
+        return {
+            "run_id": self.current_run_id,
+            "checkpoint_id": self.checkpoint_files[-1] if self.checkpoint_files else None,
+            "trace_checkpoint_count": len(self.checkpoint_files),
+        }
+
+    def _route_metadata(self, route_id: str) -> dict[str, Any]:
+        route = self.route_map.get(route_id, {})
+        if not route:
+            return {}
+        return {
+            "title": route.get("title"),
+            "description": route.get("description"),
+            "tools": route.get("tools", []),
+            "required_permissions": route.get("required_permissions", []),
+            "required_slots": route.get("required_slots", {}),
+            "validator": route.get("validator") or route.get("manifests"),
+        }
+
+    def _route_sandbox_tools(self, route_id: str) -> set[str]:
+        route = self.route_map.get(route_id, {})
+        policy = route.get("policy", {})
+        candidates = policy.get("tool_sandbox_required")
+        sandbox_tools: set[str] = set()
+        if isinstance(candidates, str):
+            if candidates.strip():
+                sandbox_tools.add(candidates.strip())
+        elif isinstance(candidates, (list, tuple, set)):
+            for item in candidates:
+                if isinstance(item, str) and item.strip():
+                    sandbox_tools.add(item.strip())
+        return sandbox_tools
+
+    def _final_payload(
+        self,
+        status: str,
+        next_action: str,
+        final_response: Optional[str],
+        route_id: str,
+        tool_outputs: list[Dict[str, Any]] | None = None,
+        validation: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        responses = final_response if final_response is not None else None
+        outputs = tool_outputs or []
+        validation = validation or {"ok": status == "ok", "missing_fields": [], "failed_route_ids": []}
+        evidence = self._build_evidence_rows(route_id, responses or "", outputs) if status != "blocked" and status != "validation_failed" else []
+        claims = self._build_claims(route_id, responses or "", evidence, bool(validation.get("ok", False))
+                                ) if evidence else []
+        payload = {
+            "status": status,
+            "next_action": next_action,
+            "final_response": responses,
+            "tool_calls_used": self.tool_calls_used,
+            "route_id": route_id,
+            "route_metadata": self._route_metadata(route_id),
+            "budgets": self.budgets,
+            "trace": [e.__dict__ for e in self.phase_trace],
+            "trace_phase_count": len(self.phase_trace),
+            "trace_checkpoint_count": self._common_response_meta().get("trace_checkpoint_count"),
+            "run_id": self._common_response_meta().get("run_id"),
+            "checkpoint_id": self._common_response_meta().get("checkpoint_id"),
+            "evidence": evidence,
+            "claims": claims,
+            "validation": validation,
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
+    @staticmethod
+    def _route_validator(route: Dict[str, Any] | None) -> Dict[str, Any]:
+        if not isinstance(route, dict):
+            return {}
+        validator = route.get("validator")
+        if isinstance(validator, dict):
+            return validator
+
+        manifests = route.get("manifests")
+        if isinstance(manifests, dict):
+            fields = manifests.get("validator_fields") or []
+            hard_fail = manifests.get("hard_fail_errors", [])
+            if isinstance(fields, list) or isinstance(hard_fail, list):
+                return {
+                    "required_evidence_fields": list(fields) if isinstance(fields, list) else [],
+                    "hard_fail_errors": list(hard_fail) if isinstance(hard_fail, list) else [],
+                }
+        return {}
 
     def _llm_json(self, system_prompt: str, user_prompt: str, max_tokens: int = 500) -> Optional[Dict[str, Any]]:
         # Ask the LLM only when enabled; return raw structured JSON or None.
@@ -883,18 +1073,20 @@ class RealHarnessEngine:
         route = self.route_map.get(route_id, {})
         plan: List[Dict[str, Any]] = []
         for tool in route.get("tools", []) or []:
+            arguments: Dict[str, Any] = {}
             if tool == "run_tests":
-                call = {"name": "run_tests", "arguments": {"scope": slots.get("scope")}}
-                plan.append(call)
-                self._log(
-                    "build_plan",
-                    "Planner",
-                    "append tool call",
-                    {"route": route_id, "tool": call["name"]},
-                    call,
-                    "build_plan",
-                    explanation="Each supported tool contributes a single callable plan row.",
-                )
+                arguments = {"scope": slots.get("scope")}
+            call = {"name": tool, "arguments": arguments}
+            plan.append(call)
+            self._log(
+                "build_plan",
+                "Planner",
+                "append tool call",
+                {"route": route_id, "tool": call["name"]},
+                call,
+                "build_plan",
+                explanation="Each supported tool contributes a single callable plan row.",
+            )
 
         self._log(
             "build_plan",
@@ -908,27 +1100,162 @@ class RealHarnessEngine:
         return {"plan": plan, "next_action": "execute_tools" if plan else "summarize"}
 
     def _tool_run_tests(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        # Execute pytest in the current environment and return compact pass/fail details.
-        scope = args.get("scope")
-        cmd = [sys.executable, "-m", "pytest"]
-        if scope:
-            cmd.append(str(scope))
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90, check=False)
-            return {
-                "success": proc.returncode == 0,
-                "tool": "run_tests",
-                "returncode": proc.returncode,
-                "output": (proc.stdout or "")[-5000:],
-            }
-        except Exception as exc:
-            return {"success": False, "tool": "run_tests", "error": str(exc)}
+        # Execute pytest in a centralized registry-backed tool path.
+        result = execute_tool("run_tests", args if isinstance(args, dict) else {})
+        return self._normalize_tool_result("run_tests", args if isinstance(args, dict) else {}, result)
 
-    def phase_execute_tools(self, plan: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _tool_run_sandbox(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        # Execute declared heavy tools in Docker sandbox mode.
+        payload = args if isinstance(args, dict) else {}
+        start = self._utc_now()
+        if name != "run_tests":
+            return {
+                "tool": name,
+                "success": False,
+                "arguments": redact_sensitive_args(payload),
+                "error": "tool_sandbox_exec_error",
+                "error_code": "tool_sandbox_exec_error",
+                "sandbox": "docker",
+                "started_at": start,
+                "finished_at": self._utc_now(),
+            }
+
+        if shutil.which("docker") is None:
+            return {
+                "tool": name,
+                "success": False,
+                "arguments": redact_sensitive_args(payload),
+                "error": "tool_sandbox_unavailable",
+                "error_code": "tool_sandbox_unavailable",
+                "sandbox": "docker",
+                "started_at": start,
+                "finished_at": self._utc_now(),
+            }
+
+        scope = str(payload.get("scope", "")).strip() if isinstance(payload.get("scope"), str) else ""
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{Path.cwd()}:/workspace",
+            "-w",
+            "/workspace",
+            self.sandbox_image,
+            "pytest",
+        ]
+        if scope:
+            cmd.append(scope)
+
+        try:
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=max(5, self.sandbox_timeout))
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "tool": name,
+                "success": False,
+                "arguments": redact_sensitive_args(payload),
+                "error": "tool_sandbox_timeout",
+                "error_code": "tool_sandbox_timeout",
+                "sandbox": "docker",
+                "command": cmd,
+                "stdout": str(exc.stdout or ""),
+                "stderr": str(exc.stderr or ""),
+                "started_at": start,
+                "finished_at": self._utc_now(),
+            }
+        except OSError as exc:
+            return {
+                "tool": name,
+                "success": False,
+                "arguments": redact_sensitive_args(payload),
+                "error": "tool_sandbox_exec_error",
+                "error_code": "tool_sandbox_exec_error",
+                "sandbox": "docker",
+                "command": cmd,
+                "error_detail": str(exc),
+                "started_at": start,
+                "finished_at": self._utc_now(),
+            }
+
+        payload_out = {
+            "sandbox": "docker",
+            "command": cmd,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+        }
+        if proc.returncode == 0:
+            return {
+                "tool": name,
+                "success": True,
+                "arguments": redact_sensitive_args(payload),
+                "error": None,
+                "error_code": None,
+                "sandbox": "docker",
+                "output": payload_out,
+                "started_at": start,
+                "finished_at": self._utc_now(),
+            }
+        return {
+            "tool": name,
+            "success": False,
+            "arguments": redact_sensitive_args(payload),
+            "error": "tool_return_nonzero",
+            "error_code": "tool_return_nonzero",
+            "sandbox": "docker",
+            "output": payload_out,
+            "started_at": start,
+            "finished_at": self._utc_now(),
+        }
+
+    def _tool_run_generic(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        # Execute any declared tool through the registry for typed outcomes.
+        result = execute_tool(name, args if isinstance(args, dict) else {})
+        return self._normalize_tool_result(name, args if isinstance(args, dict) else {}, result)
+
+    def _normalize_tool_result(self, name: str, args: Dict[str, Any], result: Any) -> Dict[str, Any]:
+        # Normalize registry result payload for stable checkpoint/error behavior.
+        normalized: Dict[str, Any] = {
+            "tool": name,
+            "success": bool(result.success),
+            "arguments": redact_sensitive_args(args),
+            "error": result.error,
+            "error_code": result.error_code,
+        }
+        if result.started_at:
+            normalized["started_at"] = result.started_at
+        if result.finished_at:
+            normalized["finished_at"] = result.finished_at
+        if result.sandbox:
+            normalized["sandbox"] = result.sandbox
+        if isinstance(result.output, dict):
+            output_payload = redact_sensitive_args(result.output)
+            normalized["output"] = output_payload
+            for output_key, output_value in output_payload.items():
+                if output_key not in normalized:
+                    normalized[output_key] = output_value
+        elif result.output is not None:
+            normalized["output"] = redact_sensitive_args(result.output)
+        return normalized
+
+    def _guard_tool_output(self, out: Dict[str, Any]) -> Dict[str, Any]:
+        result = check_tool_output(json.dumps(out, ensure_ascii=False, default=str))
+        if result.allow:
+            return out
+        out = dict(out)
+        out["success"] = False
+        out["error"] = result.reason or "tool_output_blocked"
+        out["error_code"] = "tool_output_blocked"
+        return out
+
+    def phase_execute_tools(self, route_id: str, plan: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Dispatch each plan row and collect output objects, tracking call budget.
         outputs: List[Dict[str, Any]] = []
-        for call in plan:
+        budget_exhausted = False
+        sandbox_tools = set(self._route_sandbox_tools(route_id))
+        for index, call in enumerate(plan):
             if self.tool_calls_used >= self.max_tool_calls:
+                budget_exhausted = True
                 self._log(
                     "execute_tools",
                     "ToolExecutor",
@@ -938,11 +1265,49 @@ class RealHarnessEngine:
                     "summarize",
                     explanation="Stop dispatching when tool budget is exceeded.",
                 )
-                outputs.append({"success": False, "tool": call.get("name"), "error": "tool_calls_budget_exceeded"})
-                continue
+                outputs.append(
+                    {
+                        "tool": "tool_budget_guard",
+                        "success": False,
+                        "error": "tool_calls_budget_exceeded",
+                        "error_code": "tool_calls_budget_exceeded",
+                        "branch": "tool_budget_guard",
+                        "tool_calls_limit": self.max_tool_calls,
+                        "plan_index": index,
+                        "planned_tool_count": len(plan),
+                    }
+                )
+                break
 
             name = str(call.get("name", ""))
             args = call.get("arguments", {}) if isinstance(call.get("arguments", {}), dict) else {}
+            if not args:
+                args = {}
+            gate = check_tool_request_with_tool(args, tool_name=name)
+            if not gate.allow:
+                outputs.append(
+                    {
+                        "tool": name,
+                        "success": False,
+                        "arguments": redact_sensitive_args(args),
+                        "error": gate.reason or "tool_request_blocked",
+                        "error_code": "tool_request_blocked",
+                        "started_at": self._utc_now(),
+                        "finished_at": self._utc_now(),
+                        "tool_budget_blocked": True,
+                    }
+                )
+                self._log(
+                    "execute_tools",
+                    "ToolExecutor",
+                    "tool request blocked",
+                    {"name": name},
+                    {"error": gate.reason},
+                    "summarize",
+                    explanation="Pre-tool guard blocked execution before dispatch.",
+                )
+                self.tool_calls_used += 1
+                continue
             self._log(
                 "execute_tools",
                 "ToolExecutor",
@@ -953,10 +1318,16 @@ class RealHarnessEngine:
                 explanation="Call the next tool in plan order.",
             )
 
-            if name == "run_tests":
+            is_sandboxed = self.tool_sandbox_mode == "docker" and (name == "run_tests" or name in sandbox_tools)
+            if is_sandboxed:
+                out = self._tool_run_sandbox(name, args)
+            elif name == "run_tests":
                 out = self._tool_run_tests(args)
             else:
-                out = {"success": False, "tool": name, "error": "unknown_tool"}
+                out = self._tool_run_generic(name, args)
+
+            if out.get("error_code") not in {None, "tool_not_allowed", "unknown_tool"}:
+                out = self._guard_tool_output(out)
 
             self.tool_calls_used += 1
             self._log(
@@ -969,6 +1340,54 @@ class RealHarnessEngine:
                 explanation="Append execution output and continue until all plan entries are processed.",
             )
             outputs.append(out)
+
+        execute_status = "ok"
+        error_codes = {str(item.get("error_code") or "") for item in outputs}
+        has_failure = any(not bool(item.get("success", False)) for item in outputs)
+        if budget_exhausted:
+            execute_status = "tool_budget_exhausted"
+        elif has_failure:
+            execute_status = "partial_fail"
+        if not outputs:
+            outputs.append(
+                {
+                    "tool": "none",
+                    "success": True,
+                    "arguments": {},
+                    "error": None,
+                    "error_code": None,
+                    "started_at": self._utc_now(),
+                    "finished_at": self._utc_now(),
+                    "tool_outputs": [],
+                }
+            )
+
+        self._checkpoint(
+            phase="execute_tools",
+            run_id=self.current_run_id or str(uuid.uuid4()),
+            route_id=route_id,
+            attempt=self.attempt,
+            status=execute_status,
+            next_action="summarize",
+            error_code=(
+                "tool_budget_exhausted"
+                if budget_exhausted
+                else (
+                    "tool_output_blocked"
+                    if "tool_output_blocked" in error_codes
+                    else ("tool_return_nonzero" if "tool_return_nonzero" in error_codes else None)
+                )
+            ),
+            payload={
+                "tool_outputs": outputs,
+                "tool_calls_used": self.tool_calls_used,
+                "max_tool_calls": self.max_tool_calls,
+                "tool_budget_guarded": budget_exhausted,
+                "tool_budget_limit": self.max_tool_calls,
+                "planned_tool_count": len(plan),
+                "error_codes": sorted(code for code in error_codes if code),
+            },
+        )
 
         self._log(
             "execute_tools",
@@ -1007,6 +1426,12 @@ class RealHarnessEngine:
             if not tool_outputs:
                 return "No tests were run."
             t = tool_outputs[0]
+            if t.get("returncode") is None and isinstance(t.get("output"), dict):
+                nested = t.get("output") or {}
+                returncode = nested.get("returncode")
+                if returncode is not None and "returncode" not in t:
+                    t = dict(t)
+                    t["returncode"] = returncode
             if t.get("success"):
                 return "Run tests passed."
             return f"Run tests failed: rc={t.get('returncode')}."
@@ -1075,58 +1500,91 @@ class RealHarnessEngine:
 
     def phase_validate(self, route_id: str, final_response: str, tool_outputs: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Validate final evidence/format before marking the run as successful.
-        manifests = self.route_map.get(route_id, {}).get("manifests")
-        required = manifests.get("validator_fields", []) if isinstance(manifests, dict) else []
+        route_meta = self.route_map.get(route_id, {})
+        validator = self._route_validator(route_meta)
+        required = [str(x) for x in validator.get("required_evidence_fields", [])]
+        hard_fail = [str(x) for x in validator.get("hard_fail_errors", [])]
+        hard_fail_set = set(hard_fail)
+        hard_fail_set.add("unknown_tool")
 
-        if not required:
+        evidence_rows: list[Dict[str, Any]] = []
+        for row in tool_outputs:
+            if isinstance(row, dict):
+                evidence_rows.append(row)
+                output = row.get("output")
+                if isinstance(output, dict):
+                    evidence_rows.append(output)
+
+        if final_response is not None:
+            evidence_rows.append({"final_response": redact_sensitive_args(final_response)})
+
+        missing: list[str] = []
+        for field in required:
+            found = False
+            for row in evidence_rows:
+                if row.get(field) not in (None, "", []):
+                    found = True
+                    break
+            if not found:
+                missing.append(field)
+
+        tool_error_codes = []
+        for row in tool_outputs:
+            if isinstance(row, dict):
+                error_code = row.get("error_code")
+                if isinstance(error_code, str) and error_code:
+                    tool_error_codes.append(error_code)
+        hard_fail_from_tools = any(code in hard_fail_set for code in tool_error_codes)
+
+        if required:
+            if self.require_evidence:
+                ok = not missing
+            else:
+                ok = not hard_fail_from_tools
+        else:
+            ok = not hard_fail_from_tools
+
+        next_action = "report" if ok else "ask_clarification"
+        status = "ok" if ok else "failed"
+        detail = {"required": required, "found": evidence_rows, "missing_fields": missing}
+        if not ok:
+            reason = "missing_required_evidence" if (self.require_evidence and missing) else "insufficient_fields"
+            if self.require_evidence and hard_fail:
+                reason = next((x for x in hard_fail if "missing" in x or "required" in x), reason)
             self._log(
                 "validate",
-            "PolicyValidator",
-            "no hard validator configured",
-            {"route": route_id},
-            {"ok": True},
-            "report",
-            explanation="No validation contract means we accept output immediately.",
-        )
-        return {"ok": True, "next_action": "report"}
-
-        if route_id == "run_tests":
-            if not tool_outputs:
-                self._log(
-                    "validate",
                 "PolicyValidator",
-                "missing tool output",
-                {"route": route_id},
-                {"ok": False, "reason": "no_tool_output"},
+                "required fields check failed",
+                {"route": route_id, "required": required},
+                {"ok": False, "missing_fields": missing, "failed_route_ids": [route_id]},
                 "ask_clarification",
-                explanation="Run-test route must produce output before validation can pass.",
+                explanation="Route validation failed due to missing required evidence fields.",
             )
-            return {"ok": False, "next_action": "ask_clarification", "reason": "no_tool_output"}
-
-            top = tool_outputs[0]
-            missing = [f for f in required if top.get(f) in (None, "")]
-            ok = not missing
-            self._log(
-                "validate",
-                "PolicyValidator",
-                "required fields check",
-                {"required": required, "evidence": top},
-                {"ok": ok, "missing": missing},
-                "report" if ok else "ask_clarification",
-                explanation="Route-specific validator fields must be present in evidence row.",
-            )
-            return {"ok": ok, "next_action": "report" if ok else "ask_clarification", "missing": missing}
+            return {
+                "ok": False,
+                "next_action": next_action,
+                "missing_fields": missing,
+                "failed_route_ids": [route_id],
+                "reason": reason,
+                "validation": {"status": status, "detail": detail},
+            }
 
         self._log(
             "validate",
             "PolicyValidator",
-            "validation skipped",
-            {"route": route_id},
+            "required fields check passed",
+            {"route": route_id, "required": required},
             {"ok": True},
             "report",
-            explanation="Default pass: no additional validator branch required.",
+            explanation="All required evidence fields are present.",
         )
-        return {"ok": True, "next_action": "report"}
+        return {
+            "ok": True,
+            "next_action": next_action,
+            "missing_fields": [],
+            "failed_route_ids": [],
+            "validation": {"status": status, "detail": detail},
+        }
 
     def phase_meta_route(self, query: str) -> Dict[str, Any]:
         # Meta route tries one more pass at selecting a concrete route from LLM.
@@ -1151,37 +1609,100 @@ class RealHarnessEngine:
         self.phase_trace = []
         self.tool_calls_used = 0
         self.attempt = 1
+        self.current_run_id = str(uuid.uuid4())
+        run_id = self.current_run_id
+        self.checkpoint_files = []
+        trusted_input, untrusted_input = split_trusted_untrusted(query)
+        sanitized_query = sanitize_text(untrusted_input or trusted_input or query)
 
         self._log(
             "main",
             "HarnessRuntime",
             "run() invoked",
-            {"query": query},
+            {"query": sanitized_query},
             {"attempt": self.attempt},
             "inspect_query",
             explanation="Every run starts from main and proceeds through inspect_query next.",
         )
+        self._checkpoint(
+            phase="bootstrap",
+            run_id=run_id,
+            route_id="bootstrap",
+            attempt=self.attempt,
+            status="ok",
+            next_action="inspect_query",
+            payload={"query": sanitized_query},
+        )
 
-        if not query.strip():
+        input_decision = check_input_text(sanitized_query)
+        if not input_decision.allow:
+            self._log(
+                "main",
+                "HarnessRuntime",
+                "input blocked by policy",
+                {"query": sanitized_query},
+                {"reason": input_decision.reason},
+                "stop",
+                explanation="Input guard triggered before inspection/symbolic routing.",
+            )
+            self._checkpoint(
+                phase="input_check",
+                run_id=run_id,
+                route_id="bootstrap",
+                attempt=self.attempt,
+                status="blocked",
+                next_action="ask_clarification",
+                error_code=input_decision.reason or "input_blocked",
+                payload={"query": sanitized_query},
+            )
+            return self._final_payload(
+                status="blocked",
+                next_action="ask_clarification",
+                final_response="Input blocked by policy.",
+                route_id="bootstrap",
+                extra={
+                    "validation": {"ok": False, "missing_fields": [], "failed_route_ids": ["bootstrap"]},
+                    "guard": {"input": {"allow": False, "reason": input_decision.reason}},
+                },
+            )
+
+        if not sanitized_query.strip():
             self._log(
                 "main",
                 "HarnessRuntime",
                 "reject empty input",
-                {"query": query},
+                {"query": sanitized_query},
                 {"status": "blocked"},
                 "stop",
                 explanation="Empty query is not executable and needs clarification.",
             )
-            return {
-                "status": "blocked",
-                "next_action": "ask_clarification",
-                "final_response": None,
-                "tool_calls_used": 0,
-                "budgets": self.budgets,
-                "trace": [],
-            }
+            self._checkpoint(
+                phase="input_check",
+                run_id=run_id,
+                route_id="bootstrap",
+                attempt=self.attempt,
+                status="blocked",
+                next_action="ask_clarification",
+                error_code="empty_input",
+                payload={"query": sanitized_query},
+            )
+            return self._final_payload(
+                status="blocked",
+                next_action="ask_clarification",
+                final_response=None,
+                route_id="bootstrap",
+            )
 
-        inspect = self.phase_inspect_query(query)
+        inspect = self.phase_inspect_query(sanitized_query)
+        self._checkpoint(
+            phase="inspect_query",
+            run_id=run_id,
+            route_id="bootstrap",
+            attempt=self.attempt,
+            status="ok",
+            next_action="route_classify",
+            payload={"query_profile": inspect.get("query_profile")},
+        )
         self._log(
             "main",
             "HarnessRuntime",
@@ -1194,6 +1715,19 @@ class RealHarnessEngine:
         qprof = inspect["query_profile"]
         route_result = self.phase_route_classify(qprof)
         route_id = route_result["selected_route"]
+        self._checkpoint(
+            phase="route_classify",
+            run_id=run_id,
+            route_id=route_id,
+            attempt=self.attempt,
+            status="ok",
+            next_action=route_result.get("next_action"),
+            payload={
+                "selected_route": route_id,
+                "score": route_result.get("score"),
+                "next_action": route_result.get("next_action"),
+            },
+        )
         self._log(
             "main",
             "HarnessRuntime",
@@ -1215,6 +1749,15 @@ class RealHarnessEngine:
                 explanation="Meta route lets LLM choose a better concrete route.",
             )
             meta = self.phase_meta_route(query)
+            self._checkpoint(
+                phase="meta_route",
+                run_id=run_id,
+                route_id="meta_route",
+                attempt=self.attempt,
+                status="ok" if meta.get("route_id") != "ask_clarification" else "blocked",
+                next_action="permission_check" if meta.get("route_id") != "ask_clarification" else "ask_clarification",
+                payload={"route_id": meta.get("route_id"), "reason": meta.get("reason", "")},
+            )
             if meta.get("route_id") == "ask_clarification":
                 self._log(
                     "main",
@@ -1225,15 +1768,23 @@ class RealHarnessEngine:
                     "stop",
                     explanation="Unable to resolve a concrete route, so ask user for clarity.",
                 )
-                return {
-                    "status": "clarification_required",
-                    "next_action": "ask_clarification",
-                    "final_response": meta,
-                    "tool_calls_used": self.tool_calls_used,
-                    "route_id": "meta_route",
-                    "budgets": self.budgets,
-                    "trace": [e.__dict__ for e in self.phase_trace],
-                }
+                self._checkpoint(
+                    phase="route_classify",
+                    run_id=run_id,
+                    route_id="meta_route",
+                    attempt=self.attempt,
+                    status="blocked",
+                    error_code="meta_route_unresolved",
+                    payload={"reason": meta.get("reason")},
+                )
+                return self._final_payload(
+                    status="clarification_required",
+                    next_action="ask_clarification",
+                    final_response=meta,
+                    route_id="meta_route",
+                    validation={"ok": False, "failed_route_ids": ["meta_route"]},
+                    extra={"meta": meta},
+                )
             route_id = meta.get("route_id")
             self._log(
                 "main",
@@ -1256,6 +1807,15 @@ class RealHarnessEngine:
                 "ask_clarification",
                 explanation="Unknown route ids are not executable; request clarification.",
             )
+            self._checkpoint(
+                phase="route_classify",
+                run_id=run_id,
+                route_id=route_id,
+                attempt=self.attempt,
+                status="blocked",
+                error_code="unknown_route",
+                payload={"route_id": route_id},
+            )
 
         if route_result.get("next_action") == "ask_clarification":
             self._log(
@@ -1267,15 +1827,21 @@ class RealHarnessEngine:
                 "stop",
                 explanation="Confidence was too low or ambiguous for autonomous execution.",
             )
-            return {
-                "status": "clarification_required",
-                "next_action": "ask_clarification",
-                "final_response": "Please rephrase with an explicit task and constraints.",
-                "tool_calls_used": self.tool_calls_used,
-                "route_id": route_id,
-                "budgets": self.budgets,
-                "trace": [e.__dict__ for e in self.phase_trace],
-            }
+            self._checkpoint(
+                phase="route_classify",
+                run_id=run_id,
+                route_id=route_id,
+                attempt=self.attempt,
+                status="needs_clarification",
+                payload={"score": route_result.get("score")},
+            )
+            return self._final_payload(
+                status="clarification_required",
+                next_action="ask_clarification",
+                final_response="Please rephrase with an explicit task and constraints.",
+                route_id=route_id,
+                validation={"ok": False, "failed_route_ids": [route_id]},
+            )
 
         perm = self.phase_permission_check(route_id)
         if not perm.get("allowed", False):
@@ -1288,16 +1854,31 @@ class RealHarnessEngine:
                 "stop",
                 explanation="Policy denies route execution until required permissions are granted.",
             )
-            return {
-                "status": "blocked",
-                "next_action": "ask_clarification",
-                "final_response": {"missing_permissions": perm.get("missing_permissions", [])},
-                "tool_calls_used": self.tool_calls_used,
-                "route_id": route_id,
-                "budgets": self.budgets,
-                "trace": [e.__dict__ for e in self.phase_trace],
-            }
+            self._checkpoint(
+                phase="permission_check",
+                run_id=run_id,
+                route_id=route_id,
+                attempt=self.attempt,
+                status="blocked",
+                error_code="missing_permissions",
+                payload={"missing_permissions": perm.get("missing_permissions", [])},
+            )
+            return self._final_payload(
+                status="blocked",
+                next_action="ask_clarification",
+                final_response={"missing_permissions": perm.get("missing_permissions", [])},
+                route_id=route_id,
+            )
+
         slots_result = self.phase_extract_slots(route_id, qprof)
+        self._checkpoint(
+            phase="extract_slots",
+            run_id=run_id,
+            route_id=route_id,
+            attempt=self.attempt,
+            status="ok" if slots_result.get("next_action") != "ask_clarification" else "needs_clarification",
+            payload={"slots": slots_result.get("slots"), "missing": slots_result.get("missing")},
+        )
         self._log(
             "main",
             "HarnessRuntime",
@@ -1317,17 +1898,36 @@ class RealHarnessEngine:
                 "stop",
                 explanation="Cannot execute until required slots are provided.",
             )
-            return {
-                "status": "clarification_required",
-                "next_action": "ask_clarification",
-                "final_response": {"missing_slots": slots_result.get("missing", [])},
-                "tool_calls_used": self.tool_calls_used,
-                "route_id": route_id,
-                "budgets": self.budgets,
-                "trace": [e.__dict__ for e in self.phase_trace],
-            }
+            self._checkpoint(
+                phase="extract_slots",
+                run_id=run_id,
+                route_id=route_id,
+                attempt=self.attempt,
+                status="needs_clarification",
+                error_code="missing_slots",
+                payload={"missing_slots": slots_result.get("missing", [])},
+            )
+            return self._final_payload(
+                status="clarification_required",
+                next_action="ask_clarification",
+                final_response={"missing_slots": slots_result.get("missing", [])},
+                route_id=route_id,
+                validation={
+                    "ok": False,
+                    "failed_route_ids": [route_id],
+                    "missing_fields": slots_result.get("missing", []),
+                },
+            )
 
         plan_result = self.phase_build_plan(route_id, slots_result.get("slots", {}))
+        self._checkpoint(
+            phase="build_plan",
+            run_id=run_id,
+            route_id=route_id,
+            attempt=self.attempt,
+            status="ok",
+            payload={"plan": plan_result.get("plan", [])},
+        )
         if plan_result.get("next_action") == "execute_tools":
             self._log(
                 "main",
@@ -1338,8 +1938,16 @@ class RealHarnessEngine:
                 "execute_tools",
                 explanation="Plan is non-empty, so runtime executes each tool.",
             )
-            exec_result = self.phase_execute_tools(plan_result.get("plan", []))
+            exec_result = self.phase_execute_tools(route_id, plan_result.get("plan", []))
             tool_outputs = exec_result.get("tool_outputs", [])
+            self._checkpoint(
+                phase="execute_tools",
+                run_id=run_id,
+                route_id=route_id,
+                attempt=self.attempt,
+                status="ok",
+                payload={"tool_outputs": tool_outputs},
+            )
         else:
             self._log(
                 "main",
@@ -1350,11 +1958,35 @@ class RealHarnessEngine:
                 "summarize",
                 explanation="Some routes are informational and do not require tool calls.",
             )
+            self._checkpoint(
+                phase="execute_tools",
+                run_id=run_id,
+                route_id=route_id,
+                attempt=self.attempt,
+                status="skipped",
+                payload={"plan_next_action": plan_result.get("next_action")},
+            )
             tool_outputs = []
 
         summary_result = self.phase_summarize(route_id, slots_result.get("slots", {}), tool_outputs)
+        self._checkpoint(
+            phase="summarize",
+            run_id=run_id,
+            route_id=route_id,
+            attempt=self.attempt,
+            status="ok",
+            payload={"tool_output_count": len(tool_outputs)},
+        )
         final_response = summary_result.get("final_response", "")
         validation = self.phase_validate(route_id, final_response, tool_outputs)
+        self._checkpoint(
+            phase="validate",
+            run_id=run_id,
+            route_id=route_id,
+            attempt=self.attempt,
+            status="ok" if validation.get("ok") else "failed",
+            payload=validation,
+        )
         self._log(
             "main",
             "HarnessRuntime",
@@ -1375,15 +2007,22 @@ class RealHarnessEngine:
                 "stop",
                 explanation="Cannot mark run successful without required evidence.",
             )
-            return {
-                "status": "validation_failed",
-                "next_action": validation.get("next_action", "ask_clarification"),
-                "final_response": None,
-                "tool_calls_used": self.tool_calls_used,
-                "route_id": route_id,
-                "budgets": self.budgets,
-                "trace": [e.__dict__ for e in self.phase_trace],
-            }
+            self._checkpoint(
+                phase="final_report",
+                run_id=run_id,
+                route_id=route_id,
+                attempt=self.attempt,
+                status="failed",
+                payload=validation,
+            )
+            return self._final_payload(
+                status="validation_failed",
+                next_action=validation.get("next_action", "ask_clarification"),
+                final_response=None,
+                route_id=route_id,
+                tool_outputs=tool_outputs,
+                validation=validation,
+            )
 
         self._log(
             "main",
@@ -1394,15 +2033,22 @@ class RealHarnessEngine:
             "final_report",
             explanation="All required phases executed and validation passed.",
         )
-        return {
-            "status": "ok",
-            "next_action": "report",
-            "final_response": final_response,
-            "tool_calls_used": self.tool_calls_used,
-            "route_id": route_id,
-            "budgets": self.budgets,
-            "trace": [e.__dict__ for e in self.phase_trace],
-        }
+        self._checkpoint(
+            phase="final_report",
+            run_id=run_id,
+            route_id=route_id,
+            attempt=self.attempt,
+            status="ok",
+            payload={"status": "ok", "route_id": route_id},
+        )
+        return self._final_payload(
+            status="ok",
+            next_action="report",
+            final_response=final_response,
+            route_id=route_id,
+            tool_outputs=tool_outputs,
+            validation=validation,
+        )
 
 
 def main() -> None:

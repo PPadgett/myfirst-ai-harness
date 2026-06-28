@@ -23,3 +23,8 @@ harnessd = "harness.cli:main"
 package-dir = {"" = "."}
 packages = ["harness", "harness.adapters"]
 
+[project.optional-dependencies]
+test = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24"
+]

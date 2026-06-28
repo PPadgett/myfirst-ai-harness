@@ -13,6 +13,37 @@ This repository is a local control-plane harness that routes requests through po
 
 The core goal is to keep the model from owning the entire control loop.
 
+## Execution tracks (demo + production)
+
+This repo runs two execution tracks:
+
+- `real_ai_harness.py` is the **demo engine** (`phase`/`inspect`/`route_classify` trace output, manifest-driven behavior, educational).
+- `harnessd` (`harness.server` + `harness/runtime.py`) is the **production runtime** (`/v1/chat/completions`, `/v1/answer`).
+
+The external HTTP contract remains stable for `harnessd`.
+Demo and production share the same route manifest and evidence schema, but production enforces stricter policy gates by default.
+
+Recommended rollout controls:
+
+- `HARNESS_FEATURE_LEVEL=basic|hardening` (default `basic`)
+- `HARNESS_REQUIRE_EVIDENCE=0|1`
+- `HARNESS_ENABLE_ADVANCED_ROUTER=0|1`
+- `HARNESS_TOOL_SANDBOX=off|docker`
+
+### Quick commands
+
+- Demo run:
+  - `python real_ai_harness.py --query "..." --no-network`
+- Production local server:
+  - `python -m harness.server --config harness.yaml`
+- PowerShell one-shot helper:
+  - `. .\scripts\Invoke-HarnessOneShot.ps1`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?"`
+  - `Invoke-HarnessOneShot -Mode demo -Question "What is the best way to write tests?" --NoNetwork`
+- Baseline/parity scripts:
+  - `python scripts/run_parity_sanity.py --print-json`
+  - `python tests/benchmarks/run_trace_regression.py`
+
 ## Supported backends
 
 Current backends are:
@@ -125,7 +156,7 @@ Harness startup behavior:
 
 ```bash
 curl "http://127.0.0.1:8080/v1/chat/completions" -H "Content-Type: application/json" `
--d "{\"model\":\"hf://meta-llama/Llama-3.1-8B-Instruct\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France?\"}]}"
+-d "{\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France?\"}]}"
 ```
 
 ### Custom answer route
@@ -138,8 +169,14 @@ curl "http://127.0.0.1:8080/v1/answer" -H "Content-Type: application/json" `
 If you prefer a PowerShell-native request, use:
 
 ```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/chat/completions" -Method Post -ContentType "application/json" -Body '{"model":"hf://meta-llama/Llama-3.1-8B-Instruct","messages":[{"role":"user","content":"What is the capital of France?"}]}'
+Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/chat/completions" -Method Post -ContentType "application/json" -Body '{"messages":[{"role":"user","content":"What is the capital of France?"}]}'
 ```
+
+### One-shot helper notes
+
+- `scripts/Invoke-HarnessOneShot.ps1` is built on shared runtime helper logic (`harness/oneshot.py`).
+- Runtime mode uses model resolution order: explicit `-Model` (when supplied), then `harness.yaml`, then environment/config defaults.
+- When `-Model` is omitted in runtime mode, the generated payload does **not** include `model`; the server uses config/runtime defaults, which avoids model/request-body mismatches.
 
 ## Runtime config (`harness.yaml`)
 
@@ -206,6 +243,43 @@ model: "llama3.1:latest"
 - The compose file now uses `device_requests` to request GPU on Windows.
 - If your Linux environment requires legacy runtime mode, swap to `runtime: nvidia` and remove `device_requests`.
 
+## Rollout order and compatibility (stable API)
+
+Deployment is additive; the JSON response contract is unchanged and existing clients continue to work:
+
+1. `HARNESS_FEATURE_LEVEL=basic`
+2. `HARNESS_ENABLE_ADVANCED_ROUTER=0`
+3. `HARNESS_REQUIRE_EVIDENCE=0`
+4. `HARNESS_TOOL_SANDBOX=off`
+5. (optional) no `HARNESS_ROUTE_OVERRIDES` overrides
+
+Feature-level behavior:
+
+- `basic`: compatibility-oriented routing, permissive evidence tolerance, local-only tools unless route explicitly requires sandbox.
+- `hardening`: stricter confidence gates, confidence gap checks, evidence fail-closed for required fields.
+
+Hardened rollout (can be done per environment):
+
+1. enable `HARNESS_ENABLE_ADVANCED_ROUTER=1`
+2. enable `HARNESS_REQUIRE_EVIDENCE=1`
+3. enable `HARNESS_TOOL_SANDBOX=docker` (for heavy tools only)
+4. optionally set `HARNESS_ROUTE_OVERRIDES` to apply temporary manifest patching by route
+
+Fallback matrix:
+
+- routing drift: set `HARNESS_ENABLE_ADVANCED_ROUTER=0`
+- evidence over-blocking: set `HARNESS_REQUIRE_EVIDENCE=0`
+- sandbox instability: set `HARNESS_TOOL_SANDBOX=off`
+- per-route policy tuning issues: use `HARNESS_ROUTE_OVERRIDES` rollback first before changing global feature flags.
+
+Feature-flag defaults:
+
+- `HARNESS_FEATURE_LEVEL=basic`
+- `HARNESS_REQUIRE_EVIDENCE=0`
+- `HARNESS_TOOL_SANDBOX=off`
+- `HARNESS_ENABLE_ADVANCED_ROUTER=0`
+- `HARNESS_ROUTE_OVERRIDES` unset
+
 ## Notes
 
 - `llamacpp` still supports direct local GGUF.
@@ -222,4 +296,3 @@ model: "llama3.1:latest"
 - [harness/readme.me](/harness/readme.me) — legacy component index.
 - [harness/adapters/readme.me](/harness/adapters/readme.me) — legacy adapter index.
 - [deployment/readme.me](/deployment/readme.me) — container and deployment runbook.
-# myfirst-ai-harness

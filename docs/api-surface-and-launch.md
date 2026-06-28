@@ -9,6 +9,51 @@ This section covers request interface and how the harness is started:
 - `harness.yaml`
 - `README.md` (operational runbook)
 
+## Dual-track API and launch contract
+
+Two execution paths are intentionally preserved:
+
+- Demo path: `real_ai_harness.py` (CLI only, no OpenAI-compatible HTTP server)
+- Production path: `harness.server` behind `python -m harness.server` / `harnessd`
+
+Stable external API contract (`harnessd` path):
+
+- `POST /v1/chat/completions`
+- `POST /v1/answer`
+
+Both responses remain backward compatible and now include additive fields:
+
+- `evidence` and `claims`
+- `validation`
+- `run_id`, `checkpoint_id`, `trace_checkpoint_count`
+
+Launch behavior still loads `harness.yaml` by default; now `route_manifest_path` is also used at startup to enable shared manifest/validator policy.
+
+## Hardened security mode and rollout controls
+
+The repository keeps backward-compatible API payloads while layering hardening by feature flag:
+
+- `HARNESS_FEATURE_LEVEL=basic|hardening`
+- `HARNESS_REQUIRE_EVIDENCE=0|1`
+- `HARNESS_TOOL_SANDBOX=off|docker`
+- `HARNESS_ENABLE_ADVANCED_ROUTER=0|1`
+- `HARNESS_ROUTE_OVERRIDES` (JSON object merged as `route_overrides`)
+
+Operational guidance:
+
+- `basic` keeps permissive defaults used for compatibility.
+- `hardening` enables stricter confidence gating, route confidence gap handling, and evidence fail-closed behavior.
+- `HARNESS_REQUIRE_EVIDENCE=1` blocks validated-success until required evidence is present for the active route.
+- `HARNESS_TOOL_SANDBOX=docker` enables docker-backed execution for heavy tools while preserving local execution fallback.
+- `HARNESS_ENABLE_ADVANCED_ROUTER=1` enables manifest-driven thresholds and policy overrides.
+- `HARNESS_ROUTE_OVERRIDES='{\"direct\":{\"policy\":{\"thresholds\":{\"ask_confidence\":0.84}}}}'` can apply temporary rollout overrides for a route.
+
+Rollout / rollback:
+
+- Start with `basic`, `HARNESS_REQUIRE_EVIDENCE=0`, `HARNESS_TOOL_SANDBOX=off`, `HARNESS_ENABLE_ADVANCED_ROUTER=0`.
+- Enable hardening and sandbox flags only after parity and benchmark thresholds pass.
+- If regressions appear, disable `HARNESS_TOOL_SANDBOX` and `HARNESS_REQUIRE_EVIDENCE`, then rerun `scripts/run_parity_sanity.py`.
+
 ## 1) `harness/server.py` — HTTP surface + lifecycle
 
 What it does:
@@ -122,4 +167,3 @@ docker compose --profile nvidia --env-file .env.nvidia -f docker-compose.nvidia.
 Copy-Item .env.ollama.example .env.ollama
 docker compose --profile ollama --env-file .env.ollama -f docker-compose.nvidia.yaml up --build
 ```
-

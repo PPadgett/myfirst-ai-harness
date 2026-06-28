@@ -1,0 +1,32 @@
+[
+  {
+    "query": "What is the capital of France?",
+    "expect": {
+      "status": "ok",
+      "route_category": "informational",
+      "next_action": "report",
+      "trace_checkpoint_count_min": 5,
+      "permission_blocked": false
+    }
+  },
+  {
+    "query": "Please run tests for all modules",
+    "expect": {
+      "status": "ok",
+      "route_category": "tool_action",
+      "next_action": "report",
+      "trace_checkpoint_count_min": 5,
+      "permission_blocked": false
+    }
+  },
+  {
+    "query": "Summarize this text: The harness should keep each phase explicit and auditable.",
+    "expect": {
+      "status": "ok",
+      "route_category": "informational",
+      "next_action": "report",
+      "trace_checkpoint_count_min": 5,
+      "permission_blocked": false
+    }
+  }
+]

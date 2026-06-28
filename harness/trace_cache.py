@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 import hashlib
@@ -20,6 +20,8 @@ class TraceEvent:
     stages: list[dict[str, Any]]
     request: dict[str, Any]
     result_summary: dict[str, Any]
+    checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    state_diffs: dict[str, Any] | None = None
     created_at: str = datetime.now(timezone.utc).isoformat()
 
 
@@ -63,4 +65,3 @@ class ResponseCache:
         for old in entries[self.max_entries :]:
             old.unlink(missing_ok=True)
         return key
-

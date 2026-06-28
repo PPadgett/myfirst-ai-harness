@@ -56,7 +56,7 @@ permissions:
 routes:
   - id: llm_answer
     title: General reasoning and knowledge response
-    is_universal_fallback: true
+    is_universal_fallback: false
     description: >
       Answer arbitrary user questions, clarifications, comparisons,
       analysis prompts, and general-fact queries in the same language.
@@ -95,6 +95,12 @@ routes:
         required: true
       language_guess:
         required: false
+    validator:
+      required_evidence_fields:
+        - answer
+      hard_fail_errors:
+        - missing_required_field:answer
+        - insufficient_evidence
     prompts:
       slot_extractor: |
         Return strict JSON only.
@@ -128,6 +134,13 @@ routes:
         required: true
       target_length:
         required: false
+    validator:
+      required_evidence_fields:
+        - summary
+        - source_text
+      hard_fail_errors:
+        - missing_required_field:summary
+        - missing_required_field:source_text
     prompts:
       slot_extractor: |
         Return strict JSON only with keys source_text and target_length.
@@ -241,6 +254,20 @@ routes:
         required: false
     tools:
       - run_tests
+    validator:
+      required_evidence_fields:
+        - returncode
+        - success
+      hard_fail_errors:
+        - tool_not_allowed
+        - tool_return_nonzero
+        - tool_output_blocked
+    policy:
+      tool_sandbox_required:
+        - run_tests
+      thresholds:
+        ask_confidence: 0.78
+        ask_gap: 0.06
     prompts:
       slot_extractor: |
         Return strict JSON only with one key: scope.
@@ -280,6 +307,11 @@ routes:
     required_slots:
       bug_text:
         required: true
+    validator:
+      required_evidence_fields:
+        - summary
+      hard_fail_errors:
+        - missing_required_field:summary
     prompts:
       slot_extractor: |
         Return strict JSON only with key bug_text.
@@ -318,6 +350,11 @@ routes:
         required: false
       body:
         required: false
+    validator:
+      required_evidence_fields:
+        - status
+      hard_fail_errors:
+        - missing_required_field:status
     prompts:
       slot_extractor: |
         Return strict JSON only with keys to, subject, body.
