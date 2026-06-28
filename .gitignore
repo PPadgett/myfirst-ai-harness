@@ -8,3 +8,5 @@ traces/
 .env.ollama
 .nim-cache/
 .ollama/
+state/
+tests/benchmarks/trace_regression.json
