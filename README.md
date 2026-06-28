@@ -222,3 +222,4 @@ model: "llama3.1:latest"
 - [harness/readme.me](/harness/readme.me) — legacy component index.
 - [harness/adapters/readme.me](/harness/adapters/readme.me) — legacy adapter index.
 - [deployment/readme.me](/deployment/readme.me) — container and deployment runbook.
+# myfirst-ai-harness
