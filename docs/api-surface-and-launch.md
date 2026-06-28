@@ -68,7 +68,7 @@ What it does:
 - Resolves backend:
   - `llamacpp`
   - `nvidia_nim`
-  - `ollama`
+  - `ollama` (legacy/explicit opt-in)
   - `openai`
   - `auto` fallback
 - Performs startup readiness checks against provider model catalog for configured compatibility backends.
@@ -120,7 +120,7 @@ What role it plays in launch:
 Launch integration notes:
 
 - Keep `HARNESS_*` environment vars explicit in compose for reproducible infra.
-- Prefer config-per-profile (`harness-nvidia.yaml`, `harness-ollama.yaml`) for GPU/local provider consistency.
+- Prefer config-per-profile (`harness-nvidia.yaml`) for primary GPU/local provider consistency; keep `harness-ollama.yaml` only when explicit Ollama legacy support is needed.
 
 ---
 
@@ -152,7 +152,7 @@ How to evolve config UX:
 This is the user-facing operational contract:
 
 - local non-container startup (`python -m harness.server`)
-- containerized profiles (NIM/Ollama)
+- containerized profiles (NIM default + Ollama legacy opt-in)
 - endpoint usage patterns
 - health checks and troubleshooting basics
 

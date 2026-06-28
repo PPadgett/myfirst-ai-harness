@@ -17,6 +17,15 @@ from harness.runtime import HarnessRuntime
 LOGGER = logging.getLogger(__name__)
 
 
+def _should_validate_catalog(backend_name: str, llama_cpp_model_path: str | None) -> bool:
+    backend_name = backend_name.strip().lower()
+    if backend_name in {"ollama", "nvidia_nim"}:
+        return True
+    if backend_name == "auto":
+        return not bool(llama_cpp_model_path)
+    return False
+
+
 def build_app(config: RuntimeConfig | None = None) -> FastAPI:
     cfg = config or load_runtime_config()
     app = FastAPI(title="Local LLM Harness")
@@ -71,7 +80,7 @@ def build_app(config: RuntimeConfig | None = None) -> FastAPI:
 
     @app.on_event("startup")
     async def validate_backend_connection() -> None:
-        if backend_name in {"ollama", "nvidia_nim"}:
+        if _should_validate_catalog(backend_name=backend_name, llama_cpp_model_path=cfg.backend.llama_cpp_model_path):
             await _wait_for_model_catalog(
                 base_url=cfg.backend.base_url,
                 model=cfg.model,
@@ -167,6 +176,13 @@ def _is_model_available(requested: str, available: list[str]) -> bool:
     return any(_normalize_model_name(candidate) == normalized_requested for candidate in available)
 
 
+def _build_model_catalog_url(base_url: str) -> str:
+    normalized_base_url = base_url.rstrip("/")
+    if normalized_base_url.endswith("/v1"):
+        return f"{normalized_base_url}/models"
+    return f"{normalized_base_url}/v1/models"
+
+
 async def _validate_openai_model_catalog(
     *,
     base_url: str,
@@ -174,7 +190,7 @@ async def _validate_openai_model_catalog(
     timeout_seconds: int,
     backend_label: str,
 ) -> None:
-    endpoint = base_url.rstrip("/") + "/v1/models"
+    endpoint = _build_model_catalog_url(base_url)
     try:
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.get(endpoint)

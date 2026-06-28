@@ -174,7 +174,6 @@ function _Resolve-ContainerProfile {
 
     switch -Regex ($BackendName.ToLowerInvariant()) {
         "^nvidia|^nvidia_nim|^nim$" { return "nvidia" }
-        "^ollama$" { return "ollama" }
         default { return "" }
     }
 }
@@ -285,6 +284,200 @@ function _Build-StatusPayload {
     } catch {
         return $Body
     }
+}
+
+function _Get-HarnessPropertyValue {
+    param(
+        [object]$InputObject,
+        [string]$Path
+    )
+
+    if ($null -eq $InputObject -or [string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    $current = $InputObject
+    foreach ($rawSegment in ($Path -split "\.")) {
+        if ($null -eq $current) {
+            return $null
+        }
+        if ([string]::IsNullOrWhiteSpace($rawSegment)) {
+            continue
+        }
+
+        $segment = [string]$rawSegment
+        $index = $null
+        if ($segment -match "^(?<name>[^\[]+)\[(?<index>\d+)\]$") {
+            $segment = $matches["name"]
+            $index = [int]$matches["index"]
+        }
+
+        if ($segment -match "^\d+$" -and ($current -is [System.Collections.IEnumerable]) -and ($current -isnot [string])) {
+            $items = @($current)
+            $numericIndex = [int]$segment
+            if ($numericIndex -lt 0 -or $numericIndex -ge $items.Count) {
+                return $null
+            }
+            $current = $items[$numericIndex]
+            continue
+        }
+
+        if ($current -is [System.Collections.IDictionary]) {
+            if (-not $current.Contains($segment)) {
+                return $null
+            }
+            $current = $current[$segment]
+        } elseif ($current.PSObject -and $current.PSObject.Properties.Name -contains $segment) {
+            $current = $current.$segment
+        } else {
+            return $null
+        }
+
+        if ($null -ne $index) {
+            if (($current -isnot [System.Collections.IEnumerable]) -or ($current -is [string])) {
+                return $null
+            }
+            $items = @($current)
+            if ($index -lt 0 -or $index -ge $items.Count) {
+                return $null
+            }
+            $current = $items[$index]
+        }
+    }
+
+    return $current
+}
+
+function _Select-HarnessProperties {
+    param(
+        [object]$InputObject,
+        [string[]]$Property
+    )
+
+    if ($null -eq $Property -or $Property.Count -eq 0) {
+        return $InputObject
+    }
+    if ($Property.Count -eq 1 -and $Property[0] -eq "*") {
+        return $InputObject
+    }
+
+    $requiresPathSelection = $false
+    foreach ($name in $Property) {
+        if ($name -match "[\.\[]") {
+            $requiresPathSelection = $true
+            break
+        }
+    }
+    if (-not $requiresPathSelection) {
+        return $InputObject | Select-Object -Property $Property
+    }
+
+    $selected = [ordered]@{}
+    foreach ($name in $Property) {
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+        $selected[$name] = _Get-HarnessPropertyValue -InputObject $InputObject -Path $name
+    }
+    return [PSCustomObject]$selected
+}
+
+function _Register-HarnessTypeData {
+    param(
+        [string]$TypeName,
+        [string[]]$DefaultDisplayPropertySet
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TypeName) -or $null -eq $DefaultDisplayPropertySet -or $DefaultDisplayPropertySet.Count -eq 0) {
+        return
+    }
+    try {
+        Update-TypeData -TypeName $TypeName -DefaultDisplayPropertySet $DefaultDisplayPropertySet -Force -ErrorAction Stop
+    } catch {
+        # Display metadata is best-effort and should never change command behavior.
+    }
+}
+
+function _Add-HarnessTypeName {
+    param(
+        [object]$InputObject,
+        [string]$TypeName,
+        [string[]]$DefaultDisplayPropertySet
+    )
+
+    if ($null -eq $InputObject -or [string]::IsNullOrWhiteSpace($TypeName)) {
+        return $InputObject
+    }
+    _Register-HarnessTypeData -TypeName $TypeName -DefaultDisplayPropertySet $DefaultDisplayPropertySet
+    if ($InputObject.PSObject -and $InputObject.PSObject.TypeNames[0] -ne $TypeName) {
+        $InputObject.PSObject.TypeNames.Insert(0, $TypeName)
+    }
+    return $InputObject
+}
+
+function _New-HarnessObject {
+    param(
+        [string]$TypeName,
+        [object]$Property,
+        [string[]]$DefaultDisplayPropertySet
+    )
+
+    $obj = [PSCustomObject]$Property
+    return _Add-HarnessTypeName -InputObject $obj -TypeName $TypeName -DefaultDisplayPropertySet $DefaultDisplayPropertySet
+}
+
+function _Apply-HarnessOutputOptions {
+    param(
+        [object]$InputObject,
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [bool]$AsJson = $false,
+        [int]$JsonDepth = 20
+    )
+
+    if ($JsonDepth -le 0) {
+        throw "JsonDepth must be > 0"
+    }
+
+    $output = $InputObject
+    if (-not [string]::IsNullOrWhiteSpace($ExpandProperty)) {
+        $output = _Get-HarnessPropertyValue -InputObject $output -Path $ExpandProperty
+    } elseif ($null -ne $Property -and $Property.Count -gt 0) {
+        $output = _Select-HarnessProperties -InputObject $output -Property $Property
+    }
+
+    if ($AsJson) {
+        return $output | ConvertTo-Json -Depth $JsonDepth
+    }
+    return $output
+}
+
+function _Get-HarnessOneShotAnswer {
+    param([object]$Response)
+
+    $answer = _Get-HarnessPropertyValue -InputObject $Response -Path "choices[0].message.content"
+    if ($null -eq $answer) {
+        return ""
+    }
+    return [string]$answer
+}
+
+function _Add-HarnessOneShotConvenience {
+    param([object]$Response)
+
+    if ($null -eq $Response -or -not $Response.PSObject) {
+        return $Response
+    }
+    $answer = _Get-HarnessOneShotAnswer -Response $Response
+    if ($Response.PSObject.Properties.Name -contains "answer") {
+        $Response.answer = $answer
+    } else {
+        $Response | Add-Member -NotePropertyName answer -NotePropertyValue $answer -Force
+    }
+    return _Add-HarnessTypeName `
+        -InputObject $Response `
+        -TypeName "Harness.OneShot.Response" `
+        -DefaultDisplayPropertySet @("answer", "status", "model", "route", "run_id", "next_action")
 }
 
 function _Get-ExceptionResponse {
@@ -506,7 +699,12 @@ function Get-HarnessBackendStatus {
         [int]$RequestTimeoutSeconds = 6,
         [string]$ConfigProviderProfile = "",
         [switch]$PreferProviderOnly,
-        [switch]$IncludeSession
+        [switch]$IncludeSession,
+        [Alias("Properties")]
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [switch]$AsJson,
+        [int]$JsonDepth = 20
     )
 
     $resolvedConfig = _Resolve-FilePath -Path $Config -Base (Get-Location).Path
@@ -531,6 +729,16 @@ function Get-HarnessBackendStatus {
     $status = [ordered]@{
         timestamp = (Get-Date).ToUniversalTime().ToString("o")
         config = $resolvedConfig
+        backend_name = $backendName
+        selected_model = $backendModel
+        backend_base_url = $backendUrl
+        runtime_reachable = $false
+        runtime_status_code = $null
+        runtime_error = $null
+        provider_reachable = $false
+        provider_status_code = $null
+        provider_error = $null
+        model_present_in_catalog = $false
         server = [ordered]@{
             url = $healthUrl
             reachable = $false
@@ -644,7 +852,32 @@ function Get-HarnessBackendStatus {
         }
     }
 
-    return [PSCustomObject]$status
+    $status.runtime_reachable = [bool]$status.server.reachable
+    $status.runtime_status_code = $status.server.status_code
+    $status.runtime_error = $status.server.error
+    $status.provider_reachable = [bool]$status.provider_plane.reachable
+    $status.provider_status_code = $status.provider_plane.status_code
+    $status.provider_error = $status.provider_plane.error
+    $status.model_present_in_catalog = [bool]$status.provider_plane.model_present_in_catalog
+
+    $result = _New-HarnessObject `
+        -TypeName "Harness.Backend.Status" `
+        -Property $status `
+        -DefaultDisplayPropertySet @(
+            "backend_name",
+            "selected_model",
+            "runtime_reachable",
+            "provider_reachable",
+            "model_present_in_catalog",
+            "runtime_error",
+            "provider_error"
+        )
+    return _Apply-HarnessOutputOptions `
+        -InputObject $result `
+        -Property $Property `
+        -ExpandProperty $ExpandProperty `
+        -AsJson:$AsJson.IsPresent `
+        -JsonDepth $JsonDepth
 }
 
 function Start-HarnessBackend {
@@ -662,7 +895,12 @@ function Start-HarnessBackend {
         [string]$EnvFile = "",
         [switch]$NoBuild,
         [int]$WaitSeconds = 30,
-        [switch]$DryRun
+        [switch]$DryRun,
+        [Alias("Properties")]
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [switch]$AsJson,
+        [int]$JsonDepth = 20
     )
 
     if ($WaitSeconds -lt 0) {
@@ -696,7 +934,7 @@ function Start-HarnessBackend {
             -Port $Port
 
         if ($null -ne $runningSession) {
-            return [PSCustomObject]@{
+            $result = _New-HarnessObject -TypeName "Harness.Backend.StartResult" -DefaultDisplayPropertySet @("mode", "action", "started", "host", "port", "process_id", "health_url") -Property @{
                 mode = "local"
                 started = $false
                 action = "already_running"
@@ -708,6 +946,7 @@ function Start-HarnessBackend {
                 process_id = [int]$runningSession.process_id
                 session_file = $Script:HarnessBackendSessionFile
             }
+            return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
         }
 
         $trackedPids = @{}
@@ -733,7 +972,7 @@ function Start-HarnessBackend {
             throw _Format-ListenerConflictMessage -Port $Port -Listeners $external
         }
         if ($DryRun) {
-            return [PSCustomObject]@{
+            $result = _New-HarnessObject -TypeName "Harness.Backend.StartResult" -DefaultDisplayPropertySet @("mode", "action", "started", "host", "port", "health_url") -Property @{
                 mode = "local"
                 started = $false
                 config = $resolvedConfig
@@ -743,6 +982,7 @@ function Start-HarnessBackend {
                 health_url = $healthUrl
                 session_file = $Script:HarnessBackendSessionFile
             }
+            return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
         }
 
         $stdoutPath = [System.IO.Path]::GetTempFileName()
@@ -798,7 +1038,7 @@ function Start-HarnessBackend {
         $sessions += $entry
         _Write-HarnessBackendSessions -Sessions $sessions
 
-        return [PSCustomObject]@{
+        $result = _New-HarnessObject -TypeName "Harness.Backend.StartResult" -DefaultDisplayPropertySet @("mode", "action", "started", "host", "port", "process_id", "health_url") -Property @{
             mode = "local"
             started = $true
             config = $resolvedConfig
@@ -809,6 +1049,7 @@ function Start-HarnessBackend {
             process_id = $process.Id
             session_file = $Script:HarnessBackendSessionFile
         }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
     $profile = $ContainerProfile
@@ -817,6 +1058,9 @@ function Start-HarnessBackend {
     }
 
     if ([string]::IsNullOrWhiteSpace($profile)) {
+        if ($backendName -eq "ollama") {
+            throw "Container profile for backend 'ollama' is opt-in only. Specify -ContainerProfile ollama and an Ollama env file explicitly."
+        }
         throw "Cannot infer container profile from backend '$backendName'. Specify -ContainerProfile explicitly."
     }
 
@@ -855,7 +1099,7 @@ function Start-HarnessBackend {
 
     $command = "docker $($composeArgs -join ' ')"
     if ($DryRun) {
-        return [PSCustomObject]@{
+        $result = _New-HarnessObject -TypeName "Harness.Backend.StartResult" -DefaultDisplayPropertySet @("mode", "started", "profile", "config", "health_url") -Property @{
             mode = "containerized"
             started = $false
             profile = $profile
@@ -866,6 +1110,7 @@ function Start-HarnessBackend {
             health_url = $healthUrl
             session_file = $Script:HarnessBackendSessionFile
         }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
     $compose = Start-Process -FilePath "docker" -ArgumentList $composeArgs -PassThru -NoNewWindow -Wait
@@ -895,7 +1140,7 @@ function Start-HarnessBackend {
     $sessions += $entry
     _Write-HarnessBackendSessions -Sessions $sessions
 
-    return [PSCustomObject]@{
+    $result = _New-HarnessObject -TypeName "Harness.Backend.StartResult" -DefaultDisplayPropertySet @("mode", "started", "profile", "config", "health_url") -Property @{
         mode = "containerized"
         started = $true
         profile = $profile
@@ -906,6 +1151,7 @@ function Start-HarnessBackend {
         health_url = $healthUrl
         session_file = $Script:HarnessBackendSessionFile
     }
+    return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
 }
 
 function Stop-HarnessBackend {
@@ -922,7 +1168,12 @@ function Stop-HarnessBackend {
         [string]$ComposeFile = "docker-compose.nvidia.yaml",
         [string]$EnvFile = "",
         [switch]$All,
-        [switch]$DryRun
+        [switch]$DryRun,
+        [Alias("Properties")]
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [switch]$AsJson,
+        [int]$JsonDepth = 20
     )
 
     $resolvedConfig = _Resolve-FilePath -Path $Config -Base (Get-Location).Path
@@ -977,23 +1228,25 @@ function Stop-HarnessBackend {
         }
 
         if ($DryRun) {
-            return [PSCustomObject]@{
+            $result = _New-HarnessObject -TypeName "Harness.Backend.StopResult" -DefaultDisplayPropertySet @("mode", "action", "removed_count") -Property @{
                 mode = "local"
                 action = "stopped"
                 removed_count = $removed.Count
                 removed = $removed
             }
+            return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
         }
 
         if ($removed.Count -gt 0) {
             _Write-HarnessBackendSessions -Sessions $remaining
         }
-        return [PSCustomObject]@{
+        $result = _New-HarnessObject -TypeName "Harness.Backend.StopResult" -DefaultDisplayPropertySet @("mode", "action", "removed_count") -Property @{
             mode = "local"
             action = "stopped"
             removed_count = $removed.Count
             removed = $removed
         }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
     $profile = $ContainerProfile
@@ -1008,6 +1261,9 @@ function Stop-HarnessBackend {
         $profile = _Resolve-ContainerProfile -BackendName [string]$backendContext.backend_name
     }
     if ([string]::IsNullOrWhiteSpace($profile)) {
+        if ([string]$backendContext.backend_name -eq "ollama") {
+            throw "Could not resolve container profile for backend 'ollama'. Use -ContainerProfile ollama explicitly for explicit opt-in stacks."
+        }
         throw "Could not resolve container profile. Use -ContainerProfile explicitly."
     }
 
@@ -1033,7 +1289,7 @@ function Stop-HarnessBackend {
 
     $command = "docker $($composeArgs -join ' ')"
     if ($DryRun) {
-        return [PSCustomObject]@{
+        $result = _New-HarnessObject -TypeName "Harness.Backend.StopResult" -DefaultDisplayPropertySet @("mode", "action", "removed_count", "profile", "config") -Property @{
             mode = "containerized"
             action = "stopped"
             removed_count = $removed.Count
@@ -1043,6 +1299,7 @@ function Stop-HarnessBackend {
             compose_file = $resolvedCompose
             env_file = $resolvedEnvFile
         }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
     $remaining = @($sessions | Where-Object { $_.mode -ne "containerized" -or $_.config -ne $resolvedConfig })
@@ -1060,7 +1317,7 @@ function Stop-HarnessBackend {
     if ($removed.Count -gt 0) {
         _Write-HarnessBackendSessions -Sessions $remaining
     }
-    return [PSCustomObject]@{
+    $result = _New-HarnessObject -TypeName "Harness.Backend.StopResult" -DefaultDisplayPropertySet @("mode", "action", "removed_count", "profile", "config") -Property @{
         mode = "containerized"
         action = "stopped"
         removed_count = $removed.Count
@@ -1068,6 +1325,7 @@ function Stop-HarnessBackend {
         profile = $profile
         config = $resolvedConfig
     }
+    return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
 }
 
 function Start-HarnessModelBackend {
@@ -1076,8 +1334,21 @@ function Start-HarnessModelBackend {
         [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
         [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
         [string]$Model = $Script:HarnessModelBackendDefaultModel,
+        [ValidateSet("auto", "fallback", "transformers")]
+        [string]$Backend = "auto",
+        [string]$ModelPath = "",
+        [string]$ModelsRoot = "",
+        [string[]]$ExtraModel,
+        [string]$Device = "cpu",
+        [int]$MaxNewTokens = 256,
+        [switch]$LocalOnly,
         [int]$WaitSeconds = 30,
-        [switch]$DryRun
+        [switch]$DryRun,
+        [Alias("Properties")]
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [switch]$AsJson,
+        [int]$JsonDepth = 20
     )
 
     if ($WaitSeconds -lt 0) {
@@ -1097,14 +1368,35 @@ function Start-HarnessModelBackend {
         "--port",
         $ModelBackendPort.ToString(),
         "--model",
-        $Model
+        $Model,
+        "--backend",
+        $Backend,
+        "--device",
+        $Device,
+        "--max-new-tokens",
+        $MaxNewTokens.ToString()
     )
+    if (-not [string]::IsNullOrWhiteSpace($ModelPath)) {
+        $startArgs += @("--model-path", $ModelPath)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ModelsRoot)) {
+        $startArgs += @("--models-root", $ModelsRoot)
+    }
+    if ($ExtraModel -and $ExtraModel.Count -gt 0) {
+        foreach ($extra in $ExtraModel) {
+            if ([string]::IsNullOrWhiteSpace($extra)) { continue }
+            $startArgs += @("--extra-model", $extra)
+        }
+    }
+    if ($LocalOnly.IsPresent) {
+        $startArgs += "--local-only"
+    }
     $command = "python $($startArgs -join ' ')"
 
     $existingSessions = _Prune-StaleModelSessions -Sessions (_Read-HarnessModelBackendSessions)
     $runningSession = _Find-LiveModelBackendSession -Sessions $existingSessions -ModelBackendHost $ModelBackendHost -ModelBackendPort $ModelBackendPort
     if ($null -ne $runningSession) {
-        return [PSCustomObject]@{
+        $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "action", "started", "host", "port", "model", "process_id", "health_url") -Property @{
             mode = "model_backend"
             started = $false
             action = "already_running"
@@ -1116,6 +1408,7 @@ function Start-HarnessModelBackend {
             process_id = [int]$runningSession.process_id
             session_file = $Script:HarnessModelBackendSessionFile
         }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
     $listeners = _Get-ListeningProcesses -Port $ModelBackendPort
@@ -1131,7 +1424,7 @@ function Start-HarnessModelBackend {
     }
 
     if ($DryRun) {
-        return [PSCustomObject]@{
+        $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "started", "host", "port", "model", "health_url") -Property @{
             mode = "model_backend"
             started = $false
             host = $ModelBackendHost
@@ -1141,6 +1434,7 @@ function Start-HarnessModelBackend {
             health_url = $healthUrl
             session_file = $Script:HarnessModelBackendSessionFile
         }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
     $stdoutPath = [System.IO.Path]::GetTempFileName()
@@ -1216,7 +1510,7 @@ function Start-HarnessModelBackend {
     $sessions += $entry
     _Write-HarnessModelBackendSessions -Sessions $sessions
 
-    return [PSCustomObject]@{
+    $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "started", "host", "port", "model", "process_id", "health_url") -Property @{
         mode = "model_backend"
         started = $true
         host = $ModelBackendHost
@@ -1227,7 +1521,55 @@ function Start-HarnessModelBackend {
         process_id = $process.Id
         session_file = $Script:HarnessModelBackendSessionFile
     }
+    return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
 }
+
+function Start-HarnessOwnLLMBackend {
+    [CmdletBinding()]
+    param(
+        [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
+        [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
+        [string]$Model = $Script:HarnessModelBackendDefaultModel,
+        [string]$ModelPath = "",
+        [string]$ModelsRoot = "",
+        [string[]]$ExtraModel,
+        [string]$Backend = "auto",
+        [string]$Device = "cpu",
+        [int]$MaxNewTokens = 256,
+        [switch]$LocalOnly,
+        [int]$WaitSeconds = 30,
+        [switch]$DryRun,
+        [Alias("Properties")]
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [switch]$AsJson,
+        [int]$JsonDepth = 20
+    )
+
+    return Start-HarnessModelBackend `
+        -ModelBackendHost $ModelBackendHost `
+        -ModelBackendPort $ModelBackendPort `
+        -Model $Model `
+        -Backend $Backend `
+        -ModelPath $ModelPath `
+        -ModelsRoot $ModelsRoot `
+        -ExtraModel $ExtraModel `
+        -Device $Device `
+        -MaxNewTokens $MaxNewTokens `
+        -LocalOnly:$LocalOnly.IsPresent `
+        -WaitSeconds $WaitSeconds `
+        -DryRun:$DryRun.IsPresent `
+        -Property $Property `
+        -ExpandProperty $ExpandProperty `
+        -AsJson:$AsJson.IsPresent `
+        -JsonDepth $JsonDepth
+}
+
+Set-Alias -Name Start-HarnessLocalLLMBackend -Value Start-HarnessOwnLLMBackend
+Set-Alias -Name Stop-HarnessOwnLLMBackend -Value Stop-HarnessModelBackend
+Set-Alias -Name Stop-HarnessLocalLLMBackend -Value Stop-HarnessModelBackend
+Set-Alias -Name Get-HarnessOwnLLMBackendStatus -Value Get-HarnessModelBackendStatus
+Set-Alias -Name Get-HarnessLocalLLMBackendStatus -Value Get-HarnessModelBackendStatus
 
 function Stop-HarnessModelBackend {
     [CmdletBinding()]
@@ -1235,7 +1577,12 @@ function Stop-HarnessModelBackend {
         [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
         [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
         [switch]$All,
-        [switch]$DryRun
+        [switch]$DryRun,
+        [Alias("Properties")]
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [switch]$AsJson,
+        [int]$JsonDepth = 20
     )
 
     $targetKey = "model-backend|$ModelBackendHost|$ModelBackendPort"
@@ -1266,24 +1613,26 @@ function Stop-HarnessModelBackend {
     }
 
     if ($DryRun) {
-        return [PSCustomObject]@{
+        $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StopResult" -DefaultDisplayPropertySet @("mode", "action", "removed_count") -Property @{
             mode = "model_backend"
             action = "stopped"
             removed_count = $removed.Count
             removed = $removed
         }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
     if ($removed.Count -gt 0) {
         _Write-HarnessModelBackendSessions -Sessions $remaining
     }
 
-    return [PSCustomObject]@{
+    $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StopResult" -DefaultDisplayPropertySet @("mode", "action", "removed_count") -Property @{
         mode = "model_backend"
         action = "stopped"
         removed_count = $removed.Count
         removed = $removed
     }
+    return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
 }
 
 function Get-HarnessModelBackendStatus {
@@ -1292,7 +1641,12 @@ function Get-HarnessModelBackendStatus {
         [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
         [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
         [int]$RequestTimeoutSeconds = 6,
-        [switch]$IncludeSession
+        [switch]$IncludeSession,
+        [Alias("Properties")]
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [switch]$AsJson,
+        [int]$JsonDepth = 20
     )
 
     $baseUrl = _HealthUrl -TargetHost $ModelBackendHost -Port $ModelBackendPort
@@ -1349,10 +1703,22 @@ function Get-HarnessModelBackendStatus {
         }
     }
 
+    $selectedModel = $null
+    if ($models.models -and $models.models.Count -gt 0) {
+        $selectedModel = [string]$models.models[0]
+    }
     $result = [PSCustomObject]@{
         timestamp = (Get-Date).ToUniversalTime().ToString("o")
         host = $ModelBackendHost
         port = $ModelBackendPort
+        model = $selectedModel
+        health_reachable = [bool]$health.reachable
+        health_status_code = $health.status_code
+        health_error = $health.error
+        models_reachable = [bool]$models.reachable
+        models_status_code = $models.status_code
+        models_error = $models.error
+        model_catalog_present = [bool]$models.model_present
         health = $health
         models = $models
     }
@@ -1373,7 +1739,25 @@ function Get-HarnessModelBackendStatus {
         $result | Add-Member -NotePropertyName session -NotePropertyValue $sessionEntries
     }
 
-    return $result
+    $result = _Add-HarnessTypeName `
+        -InputObject $result `
+        -TypeName "Harness.ModelBackend.Status" `
+        -DefaultDisplayPropertySet @(
+            "host",
+            "port",
+            "model",
+            "health_reachable",
+            "models_reachable",
+            "model_catalog_present",
+            "health_error",
+            "models_error"
+        )
+    return _Apply-HarnessOutputOptions `
+        -InputObject $result `
+        -Property $Property `
+        -ExpandProperty $ExpandProperty `
+        -AsJson:$AsJson.IsPresent `
+        -JsonDepth $JsonDepth
 }
 
 function Invoke-HarnessOneShot {
@@ -1402,7 +1786,13 @@ function Invoke-HarnessOneShot {
         [switch]$NoNetwork,
         [switch]$SkipBackendCheck,
         [switch]$UseExistingServer,
-        [switch]$DryRun
+        [switch]$DryRun,
+        [switch]$AnswerOnly,
+        [Alias("Properties")]
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [switch]$AsJson,
+        [int]$JsonDepth = 20
     )
 
     $ErrorActionPreference = "Stop"
@@ -1509,11 +1899,16 @@ except Exception as exc:
         if ($LASTEXITCODE -ne 0) {
             $normalized = $helperOutputText.Trim()
             if ($normalized -match "model_backend_unavailable|model backend is unavailable|is not available in catalog|Model backend is unavailable") {
+                $backendCode = "model_backend_unavailable"
+                if ($normalized -match "error_code=([a-z0-9_]+)") {
+                    $backendCode = $matches[1]
+                }
                 $backendError = @"
-Invoke-HarnessOneShot: model backend is unavailable at the configured /v1/models endpoint.
+Invoke-HarnessOneShot: runtime backend preflight failed with code $backendCode at the configured /v1/models endpoint.
 Model backend check failed and runtime may not be reachable.
-Start the model backend, or rerun with -Mode demo or -SkipBackendCheck (intended only for controlled diagnostics).
-error_code=model_backend_unavailable. $normalized
+Start your local model backend with `Start-HarnessOwnLLMBackend -Model "<model>"`,
+or rerun with -Mode demo or -SkipBackendCheck (intended only for controlled diagnostics).
+error_code=$backendCode. $normalized
 "@
                 throw $backendError
             }
@@ -1636,7 +2031,7 @@ error_code=model_backend_unavailable. $normalized
         }
 
         if ($DryRun) {
-            return [PSCustomObject]@{
+            $result = _New-HarnessObject -TypeName "Harness.OneShot.DryRun" -DefaultDisplayPropertySet @("mode", "resolved_model", "backend_name", "backend_url", "health_url") -Property @{
                 payload = $helper.payload
                 resolved_model = $helper.resolved_model
                 explicit_model = $helper.explicit_model
@@ -1647,6 +2042,10 @@ error_code=model_backend_unavailable. $normalized
                 mode = "runtime"
                 runtime_env = $runtimeEnv
             }
+            if ($AnswerOnly) {
+                $result = ""
+            }
+            return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
         }
 
         $chatUrl = if ($ServerHost -match "^(https?://)") {
@@ -1704,7 +2103,12 @@ error_code=model_backend_unavailable. $normalized
             if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
                 throw "Runtime one-shot request returned HTTP $($response.StatusCode): $($response.Content)"
             }
-            return $response.Content | ConvertFrom-Json -Depth 20
+            $result = $response.Content | ConvertFrom-Json -Depth 20
+            $result = _Add-HarnessOneShotConvenience -Response $result
+            if ($AnswerOnly) {
+                $result = $result.answer
+            }
+            return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
         } finally {
             if ($UseExistingServer -eq $false -and $startedServer -and $serverProcess -ne $null -and -not $serverProcess.HasExited) {
                 Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue
@@ -1720,7 +2124,8 @@ error_code=model_backend_unavailable. $normalized
         if ($NoNetwork) {
             $demoArgs += "--no-network"
         }
-        return & python @demoArgs
+        $result = & python @demoArgs
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
     throw "Unsupported mode: $Mode"

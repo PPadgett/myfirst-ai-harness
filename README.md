@@ -34,17 +34,17 @@ Recommended rollout controls:
 
 - Demo run:
   - `python real_ai_harness.py --query "..." --no-network`
-- Local OpenAI-compatible provider + production runtime (from-scratch, no Ollama runtime):
+- Local OpenAI-compatible provider + production runtime (from-scratch):
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
-  - `Start-HarnessModelBackend -ModelBackendPort 11435 -Model "local-foundation:v1"`
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "local-foundation:v1"`
   - `Start-HarnessBackend -ExecutionMode local -Config harness.yaml -WaitSeconds 30`
-  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -Config harness.yaml -UseExistingServer`
-  - `Get-HarnessModelBackendStatus -IncludeSession`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -Config harness.yaml -UseExistingServer -AnswerOnly`
+  - `Get-HarnessOwnLLMBackendStatus -IncludeSession`
   - `Get-HarnessBackendStatus -Config harness.yaml`
   - `Stop-HarnessBackend -ExecutionMode local -Config harness.yaml`
-  - `Stop-HarnessModelBackend -ModelBackendPort 11435`
+  - `Stop-HarnessOwnLLMBackend -ModelBackendPort 11435`
 
-- Optional containerized NVIDIA/Ollama backend stack (if you need containerized providers):
+- Optional containerized provider stack (NVIDIA NIM by default; Ollama remains explicit legacy opt-in):
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
   - `Start-HarnessBackend -ExecutionMode containerized -Config harness.yaml -EnvFile .env.nvidia`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -UseExistingServer`
@@ -63,14 +63,18 @@ Recommended rollout controls:
   - `Stop-HarnessBackend -ExecutionMode containerized -Config harness-nvidia.yaml -EnvFile .env.nvidia`
 - PowerShell one-shot helper:
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
-  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -FeatureLevel hardening -RequireEvidence -ToolSandbox off`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -FeatureLevel hardening -RequireEvidence -ToolSandbox off -AnswerOnly`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?"`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -Property answer,status,model,route`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" | ConvertTo-Json -Depth 20`
   - `Invoke-HarnessOneShot -Mode demo -Question "What is the best way to write tests?" -NoNetwork`
 - Use the helper parameters above instead of manual `$env:` assignments in the same one-liner; passing `-FeatureLevel`, `-RequireEvidence`, `-ToolSandbox`, and `-EnableAdvancedRouter` directly avoids PowerShell parsing edge cases.
 - Status checks:
   - `Get-HarnessBackendStatus -Config harness.yaml -ServerHost 127.0.0.1 -Port 8080`
   - `Get-HarnessBackendStatus -Config harness.yaml -IncludeSession`
   - `Get-HarnessBackendStatus -Config harness.yaml -PreferProviderOnly`
+  - `Get-HarnessBackendStatus -Config harness.yaml -AsJson`
+  - `Get-HarnessBackendStatus -Config harness.yaml | Format-List -Property * -Force`
 - `Get-HarnessBackendStatus` reports runtime `/health` and provider model-catalog availability, with `-PreferProviderOnly` providing a provider-only health check.
 - Baseline/parity scripts:
   - `python scripts/run_parity_sanity.py --print-json`
@@ -84,7 +88,7 @@ Current backends are:
 - `local_openai` – alias used for your own local OpenAI-compatible service (for example `harness.local_model_provider`)
 - `llamacpp` – direct local GGUF via `llama-cpp-python`
 - `nvidia_nim` (`nim`, `nvidia`, `nvidia-nim`) – NVIDIA NIM serving endpoints (local GPU or remote), including containerized local setups
-- `ollama` – Ollama OpenAI-compatible endpoint (local container or remote host)
+- `ollama` – Ollama OpenAI-compatible endpoint (legacy/explicit opt-in containerized path only)
 
 ## Install
 
@@ -107,7 +111,7 @@ python -m harness.server --config harness.yaml --host 127.0.0.1 --port 8080
 The repo includes:
 
 - `Dockerfile` – builds the harness container
-- `docker-compose.nvidia.yaml` – runs NIM and/or Ollama and the harness via compose profiles
+- `docker-compose.nvidia.yaml` – runs NIM and optional Ollama via compose profiles
 - `.env.nvidia.example` – copy and fill this before starting
 - `harness-nvidia.yaml` – harness defaults for NIM backend
 - `.env.ollama.example` – copy and fill this before starting Ollama
@@ -144,7 +148,9 @@ This brings up:
 - `nvidia-nim` on `http://127.0.0.1:8000/v1`
 - `harness` on `http://127.0.0.1:8080`
 
-### Option B: Ollama
+### Option B: Ollama (legacy opt-in)
+
+Note: this path is for teams that still maintain an Ollama container. It is intentionally optional and not part of the default local-from-scratch flow.
 
 #### 1) Configure environment
 
@@ -175,7 +181,7 @@ This brings up:
 Invoke-RestMethod -Uri "http://127.0.0.1:8080/health" -Method Get
 ```
 
-Expected: `backend` in the response matches either `ollama` or `nvidia_nim`, and `model` is your selected model.
+Expected: `backend` in the response matches your selected stack (`openai`/`local_openai`, `nvidia_nim`, or `ollama` for explicit legacy opt-in) and `model` is your selected model.
 
 Harness startup behavior:
 
@@ -210,14 +216,31 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/chat/completions" -Method Post 
 - `scripts/Invoke-HarnessOneShot.ps1` is built on shared runtime helper logic (`harness/oneshot.py`).
 - Runtime mode uses model resolution order: explicit `-Model` (when supplied), then `harness.yaml`, then environment/config defaults.
 - When `-Model` is omitted in runtime mode, the generated payload does **not** include `model`; the server uses config/runtime defaults, which avoids model/request-body mismatches.
+- PowerShell helpers return rich objects by default. Use `-Property`/`-Properties`, `-ExpandProperty`, `-AnswerOnly`, or `-AsJson` for focused interactive output without changing the HTTP response contract.
+- Use `Format-List -Property * -Force` or `ConvertTo-Json -Depth 20` at the pipeline when you want to inspect every nested field.
 - If you see provider errors during runtime mode, start with `Get-HarnessBackendStatus -PreferProviderOnly` to verify provider reachability and model presence independently of runtime health.
+
+### Local provider troubleshooting
+
+- The default local flow uses your own provider implementation (`harness.local_model_provider`) on `127.0.0.1:11435`.
+- `model_backend_unavailable` usually means the provider plane is down (for example, local backend not started).
+- Start/verify/stop the local provider with:
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "local-foundation:v1"`
+  - `Get-HarnessOwnLLMBackendStatus -ModelBackendPort 11435`
+  - `Stop-HarnessOwnLLMBackend -ModelBackendPort 11435`
+- To launch your downloaded model directly from a local folder (no Ollama dependency):
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "my-model" -Backend transformers -ModelPath "C:\\models\\my-model" -LocalOnly`
+- Keep `backend.base_url` at `http://127.0.0.1:11435/v1` for local non-container runs.
+- If you switch to containerized providers later, use `Start-HarnessBackend -ExecutionMode containerized`.
+
+For this repository's default path, you keep full control over provider choice via `harness.yaml`; Ollama remains opt-in and is never implicitly started.
 
 ## Runtime config (`harness.yaml`)
 
 ```yaml
 backend:
-  name: local_openai      # default: your own OpenAI-compatible local provider
-  # aliases also accepted: nvidia, nim, nvidia-nim
+  name: openai      # default: your own OpenAI-compatible local provider (`harness.local_model_provider`)
+  # aliases also accepted: local_openai, nim, nvidia-nim
   base_url: "http://127.0.0.1:11435/v1"
   api_key: null
   timeout_seconds: 120

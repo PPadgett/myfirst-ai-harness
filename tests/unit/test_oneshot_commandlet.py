@@ -352,7 +352,8 @@ def test_oneshot_runtime_preflights_backend_and_fails_quickly_when_unreachable(t
 
     assert completed.returncode != 0
     combined = completed.stderr + completed.stdout
-    assert "backend is unavailable" in combined
+    assert "error_code=model_backend_unavailable" in combined
+    assert f"backend_url=http://127.0.0.1:{unavailable_port}/v1/models" in combined
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
@@ -373,12 +374,13 @@ def test_oneshot_runtime_preflight_rejects_missing_catalog_model(tmp_path: Path)
             f". '{SCRIPT_PATH}' ; "
             f"Invoke-HarnessOneShot -Mode runtime -Question 'What are top 3 games?' "
             f"-Config '{config}' -Port {server_port} -RequestTimeoutSeconds 2 -StartupTimeoutSeconds 2"
-        )
-        completed = _powershell_command(command)
+    )
+    completed = _powershell_command(command)
 
     assert completed.returncode != 0
     combined = completed.stderr + completed.stdout
-    assert "is not available in catalog" in combined or "model 'qwen2.5:7b' is not available in catalog" in combined
+    assert "error_code=model_not_available" in combined or "error_code=model_backend_unavailable" in combined
+    assert "expected_model=qwen2.5:7b" in combined
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
@@ -402,6 +404,37 @@ def test_oneshot_runtime_dry_run_skips_backend_preflight(tmp_path: Path) -> None
     payload = json.loads(completed.stdout.strip())
     assert payload["backend_url"] == f"http://127.0.0.1:{unavailable_port}/v1"
     assert payload["resolved_model"] == "qwen2.5:7b"
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
+def test_oneshot_output_options_select_expand_and_json(tmp_path: Path) -> None:
+    config = tmp_path / "harness.yaml"
+    unavailable_port = _find_free_port()
+    config.write_text(
+        f"backend:\n  name: openai\n  base_url: \"http://127.0.0.1:{unavailable_port}/v1\"\n  api_key: null\n  timeout_seconds: 120\nmodel: \"qwen2.5:7b\"\n",
+        encoding="utf-8",
+    )
+
+    command = (
+        f". '{SCRIPT_PATH}' ; "
+        f"$selected = Invoke-HarnessOneShot -Mode runtime -Question 'What is 2+2?' "
+        f"-Config '{config}' -SkipBackendCheck -DryRun -Property resolved_model,mode; "
+        f"$aliasJson = Invoke-HarnessOneShot -Mode runtime -Question 'What is 2+2?' "
+        f"-Config '{config}' -SkipBackendCheck -DryRun -Properties resolved_model,backend_name -AsJson; "
+        f"$expanded = Invoke-HarnessOneShot -Mode runtime -Question 'What is 2+2?' "
+        f"-Config '{config}' -SkipBackendCheck -DryRun -ExpandProperty resolved_model; "
+        "[PSCustomObject]@{selected=$selected; alias=($aliasJson | ConvertFrom-Json); expanded=$expanded} "
+        "| ConvertTo-Json -Depth 20 -Compress"
+    )
+    completed = _powershell_command(command)
+
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    payload = json.loads(completed.stdout.strip())
+    assert payload["selected"]["resolved_model"] == "qwen2.5:7b"
+    assert payload["selected"]["mode"] == "runtime"
+    assert payload["alias"]["resolved_model"] == "qwen2.5:7b"
+    assert payload["alias"]["backend_name"] == "openai"
+    assert payload["expanded"] == "qwen2.5:7b"
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
@@ -439,6 +472,38 @@ def test_oneshot_runtime_successful_roundtrip_with_mock_provider(tmp_path: Path)
     response = json.loads(marker_match.group(1))
     assert response["status"] == "ok"
     assert response["run_id"], response["run_id"]
+    assert response["answer"] == "I can answer that."
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
+def test_oneshot_runtime_answer_only_with_mock_provider(tmp_path: Path) -> None:
+    config = tmp_path / "harness.yaml"
+    server_port = _find_free_port()
+
+    with _run_mock_chat_provider(
+        provider_port=_find_free_port(),
+        models_body={"data": [{"id": "qwen2.5:7b"}]},
+        chat_response={
+            "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "I can answer that."}}
+            ],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+        },
+        chat_status=200,
+    ) as port:
+        config.write_text(
+            f"backend:\n  name: openai\n  base_url: \"http://127.0.0.1:{port}/v1\"\n  api_key: null\n  timeout_seconds: 120\nmodel: \"qwen2.5:7b\"\n",
+            encoding="utf-8",
+        )
+        command = (
+            f". '{SCRIPT_PATH}' ; "
+            f"Invoke-HarnessOneShot -Mode runtime -Question 'What is 2+2?' "
+            f"-Config '{config}' -Port {server_port} -RequestTimeoutSeconds 2 -StartupTimeoutSeconds 2 -AnswerOnly"
+        )
+        completed = _powershell_command(command)
+
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    assert completed.stdout.strip().endswith("I can answer that.")
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
@@ -469,8 +534,7 @@ def test_oneshot_runtime_use_existing_server_handles_missing_model_backend_witho
     completed = _powershell_command(command)
     assert completed.returncode != 0
     combined = completed.stderr + completed.stdout
-    assert "model backend is unavailable" in combined.lower()
-    assert "model_backend_unavailable" in combined
+    assert "error_code=model_backend_unavailable" in combined
     assert "expected_model=qwen2.5:7b" in combined
     assert f"backend_url=http://127.0.0.1:{unavailable_backend_port}/v1/models" in combined
 
@@ -500,6 +564,13 @@ def test_oneshot_backend_status_reports_runtime_and_model_backend_health(tmp_pat
 
     assert completed.returncode == 0, completed.stderr + completed.stdout
     payload = json.loads(completed.stdout.strip())
+    assert payload["backend_name"] == "openai"
+    assert payload["selected_model"] == "qwen2.5:7b"
+    assert payload["runtime_reachable"] is True
+    assert payload["runtime_status_code"] == 200
+    assert payload["provider_reachable"] is True
+    assert payload["provider_status_code"] == 200
+    assert payload["model_present_in_catalog"] is True
     assert payload["server"]["reachable"] is True
     assert payload["server"]["status_code"] == 200
     assert payload["server"]["payload"]["backend"] == "openai"
@@ -659,6 +730,88 @@ model: qwen2.5:7b
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
+def test_oneshot_backend_start_own_llm_alias_maps_to_model_backend(tmp_path: Path) -> None:
+    port = _find_free_port()
+
+    command = (
+        f". '{SCRIPT_PATH}' ; "
+        f"$result = Start-HarnessOwnLLMBackend -ModelBackendHost '127.0.0.1' -ModelBackendPort {port} -Model 'local-foundation:v1' -DryRun; "
+        "$result | ConvertTo-Json -Depth 20 -Compress"
+    )
+    completed = _powershell_command(command)
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip())
+    assert payload["mode"] == "model_backend"
+    assert payload["started"] is False
+    assert payload["model"] == "local-foundation:v1"
+    assert f"python -m harness.local_model_provider --host 127.0.0.1 --port {port} --model local-foundation:v1" in payload["command"]
+    assert "--backend auto --device cpu --max-new-tokens 256" in payload["command"]
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
+def test_oneshot_backend_status_own_llm_alias(tmp_path: Path) -> None:
+    port = _find_free_port()
+    command = (
+        f". '{SCRIPT_PATH}' ; "
+        f"$result = Get-HarnessOwnLLMBackendStatus -ModelBackendHost '127.0.0.1' -ModelBackendPort {port} -RequestTimeoutSeconds 1; "
+        "$result | ConvertTo-Json -Depth 20 -Compress"
+    )
+    completed = _powershell_command(command)
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip())
+    assert payload["host"] == "127.0.0.1"
+    assert payload["port"] == port
+    assert payload["health"]["reachable"] is False
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
+def test_oneshot_model_backend_status_reports_flat_and_nested_fields(tmp_path: Path) -> None:
+    port = _find_free_port()
+
+    with _run_mock_runtime_status_api(
+        health_body={"ok": "true", "model": "local-foundation:v1"},
+        models_body={"data": [{"id": "local-foundation:v1"}]},
+        port=port,
+    ) as _:
+        command = (
+            f". '{SCRIPT_PATH}' ; "
+            f"Get-HarnessOwnLLMBackendStatus -ModelBackendHost '127.0.0.1' -ModelBackendPort {port} "
+            "-RequestTimeoutSeconds 2 -AsJson"
+        )
+        completed = _powershell_command(command)
+
+    assert completed.returncode == 0, completed.stderr + completed.stdout
+    payload = json.loads(completed.stdout.strip())
+    assert payload["host"] == "127.0.0.1"
+    assert payload["port"] == port
+    assert payload["model"] == "local-foundation:v1"
+    assert payload["health_reachable"] is True
+    assert payload["health_status_code"] == 200
+    assert payload["models_reachable"] is True
+    assert payload["models_status_code"] == 200
+    assert payload["model_catalog_present"] is True
+    assert payload["health"]["payload"]["ok"] == "true"
+    assert payload["models"]["models"] == ["local-foundation:v1"]
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
+def test_oneshot_backend_stop_own_llm_alias_dry_run(tmp_path: Path) -> None:
+    command = (
+        f". '{SCRIPT_PATH}' ; "
+        "$result = Stop-HarnessOwnLLMBackend -DryRun; "
+        "$result | ConvertTo-Json -Depth 20 -Compress"
+    )
+    completed = _powershell_command(command)
+
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout.strip())
+    assert payload["mode"] == "model_backend"
+    assert payload["action"] == "stopped"
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
 def test_oneshot_backend_start_local_reuses_alive_session_without_spawning_second_process(tmp_path: Path) -> None:
     config = tmp_path / "harness.yaml"
     config.write_text(
@@ -767,11 +920,19 @@ model: qwen2.5:7b
     dead_process.wait(timeout=2)
 
     with _preserve_session_file():
+        stale_key = f"local|{str(config.resolve())}|127.0.0.1|{port}"
+        existing_sessions = []
+        if STATE_SESSIONS_FILE.exists():
+            try:
+                existing_sessions = json.loads(STATE_SESSIONS_FILE.read_text(encoding="utf-8") or "[]")
+            except json.JSONDecodeError:
+                existing_sessions = []
         STATE_SESSIONS_FILE.write_text(
             json.dumps(
-                [
+                existing_sessions
+                + [
                     {
-                        "key": f"local|{str(config.resolve())}|127.0.0.1|{port}",
+                        "key": stale_key,
                         "mode": "local",
                         "process_id": dead_process.pid,
                         "config": str(config.resolve()),
@@ -793,14 +954,14 @@ model: qwen2.5:7b
         )
         completed = _powershell_command(command)
 
-    assert completed.returncode == 0, completed.stderr
-    payload = json.loads(completed.stdout.strip())
-    assert payload["mode"] == "local"
-    assert payload["action"] == "stopped"
-    assert payload["removed_count"] == 1
-    state_content = STATE_SESSIONS_FILE.read_text(encoding="utf-8").strip()
-    assert state_content == "[]"
-    assert json.loads(state_content) == []
+        assert completed.returncode == 0, completed.stderr
+        payload = json.loads(completed.stdout.strip())
+        assert payload["mode"] == "local"
+        assert payload["action"] == "stopped"
+        assert payload["removed_count"] == 1
+        state_entries = json.loads(STATE_SESSIONS_FILE.read_text(encoding="utf-8").strip() or "[]")
+        assert all(entry.get("key") != stale_key for entry in state_entries)
+        assert all(entry.get("process_id") != dead_process.pid for entry in state_entries)
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
@@ -872,3 +1033,18 @@ def test_oneshot_backend_start_container_mode_requires_profile_or_inference_for_
 
     assert completed.returncode != 0
     assert "Cannot infer container profile from backend 'openai'" in completed.stderr
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is required to run PowerShell script tests")
+def test_oneshot_backend_start_container_ollama_requires_explicit_profile(tmp_path: Path) -> None:
+    config = tmp_path / "harness.yaml"
+    config.write_text("backend:\n  name: ollama\nmodel: qwen2.5:7b\n", encoding="utf-8")
+
+    command = (
+        f". '{SCRIPT_PATH}' ; "
+        f"Start-HarnessBackend -ExecutionMode containerized -Config '{config}' -DryRun"
+    )
+    completed = _powershell_command(command)
+
+    assert completed.returncode != 0
+    assert "Container profile for backend 'ollama' is opt-in only" in completed.stderr

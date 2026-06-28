@@ -67,7 +67,7 @@ What it does:
   - `llama_cpp`, `llama-cpp` → `llamacpp`
 - Enforces known backend names and required fields:
   - requires non-empty `backend.base_url`
-  - requires non-empty `model` for OpenAI-compatible providers such as `ollama` and `nvidia_nim`
+- requires non-empty `model` for OpenAI-compatible providers such as `nvidia_nim` (and legacy `ollama` when used explicitly)
 - Resolves `backend.api_key` with env precedence:
   - `HARNESS_API_KEY`
   - `NVIDIA_API_KEY` / `NIM_API_KEY`

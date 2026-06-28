@@ -126,11 +126,13 @@ def _normalize_backend_name(raw_name: Any) -> str:
 
 
 def _resolve_backend_defaults(backend_name: str) -> str:
+    if backend_name == "openai":
+        return "http://127.0.0.1:11435/v1"
     if backend_name == "nvidia_nim":
         return "http://127.0.0.1:8000/v1"
     if backend_name == "ollama":
         return "http://127.0.0.1:11434/v1"
-    return "http://127.0.0.1:11434/v1"
+    return "http://127.0.0.1:11435/v1"
 
 
 def _resolve_backend_api_key(data: dict[str, Any], backend_name: str) -> str | None:

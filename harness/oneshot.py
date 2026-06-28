@@ -107,6 +107,8 @@ def validate_runtime_backend(
     timeout_seconds: float = 2.0,
     expected_model: str | None = None,
     skip_backend_check: bool = False,
+    max_attempts: int = 6,
+    retry_delay_seconds: float = 0.2,
 ) -> None:
     config_path = config_path or DEFAULT_CONFIG_PATH
     if skip_backend_check:
@@ -130,9 +132,30 @@ def validate_runtime_backend(
     if expected_model is not None:
         normalized_expected = str(expected_model)
 
-    try:
-        response = httpx.get(models_url, timeout=timeout_seconds)
-    except httpx.RequestError as exc:
+    if max_attempts < 1:
+        max_attempts = 1
+    if retry_delay_seconds < 0:
+        retry_delay_seconds = 0.0
+
+    request_timeout_seconds = min(float(timeout_seconds), 1.0)
+    response = None
+    last_error: Exception | None = None
+    for _attempt in range(max_attempts):
+        try:
+            response = httpx.get(models_url, timeout=request_timeout_seconds)
+            if response.status_code == 200:
+                break
+            if response.status_code < 500:
+                break
+        except httpx.RequestError as exc:
+            last_error = exc
+            response = None
+
+        if _attempt + 1 >= max_attempts:
+            break
+        time.sleep(retry_delay_seconds)
+
+    if response is None:
         raise RuntimeError(
             str(
                 RuntimeBackendError(
@@ -143,7 +166,7 @@ def validate_runtime_backend(
                     expected_model=normalized_expected,
                 )
             )
-        ) from exc
+        ) from last_error
 
     if response.status_code != 200:
         raise RuntimeError(
