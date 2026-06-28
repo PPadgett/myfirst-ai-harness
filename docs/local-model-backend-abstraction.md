@@ -41,7 +41,7 @@ What it does:
 
 Where it is used:
 
-- `harness/server.py` for `ollama` and fallback OpenAI-compatible paths.
+- `harness/server.py` for OpenAI-compatible backends, including custom local providers.
 - `harness/adapters/nvidia_nim_client.py` via subclass reuse.
 
 How to evolve this:
@@ -100,4 +100,3 @@ How to add a new backend:
 2. implement stable `generate` translation.
 3. register in server backend switch.
 4. document provider model and auth assumptions in config.
-

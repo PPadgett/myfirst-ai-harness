@@ -3,6 +3,11 @@ Set-StrictMode -Version Latest
 $Script:HarnessRepoRoot = Split-Path -Path $PSScriptRoot -Parent
 $Script:HarnessBackendStateDir = Join-Path $Script:HarnessRepoRoot "state"
 $Script:HarnessBackendSessionFile = Join-Path $Script:HarnessBackendStateDir "oneshot-backend-sessions.json"
+$Script:HarnessModelBackendStateDir = Join-Path $Script:HarnessRepoRoot "state"
+$Script:HarnessModelBackendSessionFile = Join-Path $Script:HarnessModelBackendStateDir "oneshot-model-backend-sessions.json"
+$Script:HarnessModelBackendDefaultHost = "127.0.0.1"
+$Script:HarnessModelBackendDefaultPort = 11435
+$Script:HarnessModelBackendDefaultModel = "local-foundation:v1"
 
 function _Resolve-FilePath {
     param(
@@ -57,6 +62,111 @@ function _Write-HarnessBackendSessions {
     }
 
     ConvertTo-Json -InputObject $payload -Depth 10 | Set-Content -Path $Script:HarnessBackendSessionFile -Encoding UTF8
+}
+
+function _Read-HarnessModelBackendSessions {
+    $sessions = @()
+    if (-not (Test-Path $Script:HarnessModelBackendSessionFile)) {
+        return $sessions
+    }
+    try {
+        $raw = Get-Content -Path $Script:HarnessModelBackendSessionFile -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $sessions
+        }
+        $decoded = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
+        if ($null -eq $decoded) {
+            return $sessions
+        }
+        if ($decoded -is [System.Array]) {
+            return @($decoded)
+        }
+        return @($decoded)
+    } catch {
+        return @()
+    }
+}
+
+function _Write-HarnessModelBackendSessions {
+    param([array]$Sessions)
+
+    if (-not (Test-Path $Script:HarnessModelBackendStateDir)) {
+        New-Item -ItemType Directory -Path $Script:HarnessModelBackendStateDir -Force | Out-Null
+    }
+
+    $payload = @($Sessions)
+    if ($null -eq $payload -or $payload.Count -eq 0) {
+        $payload = @()
+    } else {
+        $payload = @($payload)
+    }
+
+    ConvertTo-Json -InputObject $payload -Depth 10 | Set-Content -Path $Script:HarnessModelBackendSessionFile -Encoding UTF8
+}
+
+function _Prune-StaleModelSessions {
+    param([array]$Sessions)
+
+    $cleaned = @()
+    $changed = $false
+    foreach ($entry in $Sessions) {
+        if (-not $entry.process_id) {
+            $cleaned += $entry
+            continue
+        }
+        if (Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue) {
+            $cleaned += $entry
+            continue
+        }
+        $changed = $true
+    }
+
+    if ($changed) {
+        _Write-HarnessModelBackendSessions -Sessions $cleaned
+    }
+
+    return $cleaned
+}
+
+function _Find-LiveModelBackendSession {
+    param(
+        [array]$Sessions,
+        [string]$ModelBackendHost,
+        [int]$ModelBackendPort
+    )
+
+    $key = "model-backend|$ModelBackendHost|$ModelBackendPort"
+    foreach ($entry in $Sessions) {
+        if ($entry.mode -ne "model_backend" -or $entry.key -ne $key) {
+            continue
+        }
+        if (-not $entry.process_id) {
+            continue
+        }
+        if (Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue) {
+            return $entry
+        }
+    }
+    return $null
+}
+
+function _Format-ModelBackendListenerConflictMessage {
+    param([int]$Port, [array]$Listeners)
+
+    if ($null -eq $Listeners -or $Listeners.Count -eq 0) {
+        return "Port $Port is already in use."
+    }
+
+    $first = $Listeners[0]
+    $listenerPid = $first.process_id
+    if ($listenerPid -le 0) {
+        return "Cannot bind to port $Port because it is already in use by an external process."
+    }
+    $commandLine = _Get-ProcessCommandLine -ProcessId $listenerPid
+    if ($commandLine) {
+        return "Cannot bind to port $Port because it is already in use by process $listenerPid (command: $commandLine)."
+    }
+    return "Cannot bind to port $Port because it is already in use."
 }
 
 function _Resolve-ContainerProfile {
@@ -958,6 +1068,312 @@ function Stop-HarnessBackend {
         profile = $profile
         config = $resolvedConfig
     }
+}
+
+function Start-HarnessModelBackend {
+    [CmdletBinding()]
+    param(
+        [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
+        [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
+        [string]$Model = $Script:HarnessModelBackendDefaultModel,
+        [int]$WaitSeconds = 30,
+        [switch]$DryRun
+    )
+
+    if ($WaitSeconds -lt 0) {
+        throw "WaitSeconds must be >= 0"
+    }
+    if ([string]::IsNullOrWhiteSpace($Model)) {
+        $Model = $Script:HarnessModelBackendDefaultModel
+    }
+
+    $healthUrl = _HealthUrl -TargetHost $ModelBackendHost -Port $ModelBackendPort
+    $entryKey = "model-backend|$ModelBackendHost|$ModelBackendPort"
+    $startArgs = @(
+        "-m",
+        "harness.local_model_provider",
+        "--host",
+        $ModelBackendHost,
+        "--port",
+        $ModelBackendPort.ToString(),
+        "--model",
+        $Model
+    )
+    $command = "python $($startArgs -join ' ')"
+
+    $existingSessions = _Prune-StaleModelSessions -Sessions (_Read-HarnessModelBackendSessions)
+    $runningSession = _Find-LiveModelBackendSession -Sessions $existingSessions -ModelBackendHost $ModelBackendHost -ModelBackendPort $ModelBackendPort
+    if ($null -ne $runningSession) {
+        return [PSCustomObject]@{
+            mode = "model_backend"
+            started = $false
+            action = "already_running"
+            host = $ModelBackendHost
+            port = $ModelBackendPort
+            model = $Model
+            command = $command
+            health_url = $healthUrl
+            process_id = [int]$runningSession.process_id
+            session_file = $Script:HarnessModelBackendSessionFile
+        }
+    }
+
+    $listeners = _Get-ListeningProcesses -Port $ModelBackendPort
+    $external = @(
+        foreach ($listener in $listeners) {
+            if ($listener.process_id -gt 0) {
+                $listener
+            }
+        }
+    )
+    if ($external.Count -gt 0) {
+        throw _Format-ModelBackendListenerConflictMessage -Port $ModelBackendPort -Listeners $external
+    }
+
+    if ($DryRun) {
+        return [PSCustomObject]@{
+            mode = "model_backend"
+            started = $false
+            host = $ModelBackendHost
+            port = $ModelBackendPort
+            model = $Model
+            command = $command
+            health_url = $healthUrl
+            session_file = $Script:HarnessModelBackendSessionFile
+        }
+    }
+
+    $stdoutPath = [System.IO.Path]::GetTempFileName()
+    $stderrPath = [System.IO.Path]::GetTempFileName()
+    try {
+        $process = Start-Process -FilePath "python" -ArgumentList $startArgs -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    } catch {
+        if (Test-Path $stdoutPath) {
+            Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $stderrPath) {
+            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
+        }
+        throw "Failed to start local model backend process."
+    }
+    if ($null -eq $process) {
+        if (Test-Path $stdoutPath) {
+            Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $stderrPath) {
+            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
+        }
+        throw "Failed to start local model backend process."
+    }
+    if ($process.HasExited) {
+        $startupError = ""
+        if (Test-Path $stderrPath) {
+            $startupError = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
+        }
+        if (Test-Path $stdoutPath) {
+            Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $stderrPath) {
+            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
+        }
+        throw "Local model backend exited immediately with code $($process.ExitCode). $startupError"
+    }
+
+    if (-not (_Wait-HttpReady -HealthUrl $healthUrl -TimeoutSeconds $WaitSeconds)) {
+        $startupError = ""
+        if (Test-Path $stderrPath) {
+            $startupError = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
+        }
+        if (Test-Path $stdoutPath) {
+            Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $stderrPath) {
+            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
+        }
+        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        throw "Local model backend at $($healthUrl) did not become ready after ${WaitSeconds}s. $startupError"
+    }
+    if (Test-Path $stdoutPath) {
+        Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $stderrPath) {
+        Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $entry = @{
+        key = $entryKey
+        mode = "model_backend"
+        process_id = $process.Id
+        host = $ModelBackendHost
+        port = $ModelBackendPort
+        model = $Model
+        command = $command
+        health_url = $healthUrl
+        started_utc = (Get-Date).ToUniversalTime().ToString("o")
+    }
+
+    $sessions = @($existingSessions | Where-Object { $_.key -ne $entry.key })
+    $sessions += $entry
+    _Write-HarnessModelBackendSessions -Sessions $sessions
+
+    return [PSCustomObject]@{
+        mode = "model_backend"
+        started = $true
+        host = $ModelBackendHost
+        port = $ModelBackendPort
+        model = $Model
+        command = $command
+        health_url = $healthUrl
+        process_id = $process.Id
+        session_file = $Script:HarnessModelBackendSessionFile
+    }
+}
+
+function Stop-HarnessModelBackend {
+    [CmdletBinding()]
+    param(
+        [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
+        [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
+        [switch]$All,
+        [switch]$DryRun
+    )
+
+    $targetKey = "model-backend|$ModelBackendHost|$ModelBackendPort"
+    $rawSessions = _Read-HarnessModelBackendSessions
+    $sessions = _Prune-StaleModelSessions -Sessions $rawSessions
+    $remaining = @()
+    $removed = @()
+
+    foreach ($entry in $sessions) {
+        if ($entry.mode -ne "model_backend") {
+            $remaining += $entry
+            continue
+        }
+
+        $match = $All -or ($entry.key -eq $targetKey)
+        if (-not $match) {
+            $remaining += $entry
+            continue
+        }
+
+        $removed += $entry
+        if ($DryRun) {
+            continue
+        }
+        if ($entry.process_id -and (Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue)) {
+            Stop-Process -Id $entry.process_id -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($DryRun) {
+        return [PSCustomObject]@{
+            mode = "model_backend"
+            action = "stopped"
+            removed_count = $removed.Count
+            removed = $removed
+        }
+    }
+
+    if ($removed.Count -gt 0) {
+        _Write-HarnessModelBackendSessions -Sessions $remaining
+    }
+
+    return [PSCustomObject]@{
+        mode = "model_backend"
+        action = "stopped"
+        removed_count = $removed.Count
+        removed = $removed
+    }
+}
+
+function Get-HarnessModelBackendStatus {
+    [CmdletBinding()]
+    param(
+        [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
+        [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
+        [int]$RequestTimeoutSeconds = 6,
+        [switch]$IncludeSession
+    )
+
+    $baseUrl = _HealthUrl -TargetHost $ModelBackendHost -Port $ModelBackendPort
+    $modelsUrl = _Build-ModelCatalogUrl -BackendBaseUrl ($baseUrl -replace "/health$")
+    $health = [ordered]@{
+        url = $baseUrl
+        reachable = $false
+        status_code = $null
+        error = $null
+        payload = $null
+    }
+    try {
+        $healthResponse = Invoke-WebRequest -Uri $baseUrl -Method Get -TimeoutSec $RequestTimeoutSeconds -ErrorAction Stop
+        $health.status_code = [int]$healthResponse.StatusCode
+        $health.reachable = $healthResponse.StatusCode -ge 200 -and $healthResponse.StatusCode -lt 300
+        if ($health.reachable) {
+            $health.payload = _Build-StatusPayload -Body $healthResponse.Content
+        } else {
+            $health.error = "Health request returned status $($healthResponse.StatusCode)"
+        }
+    } catch {
+        $health.error = "Failed to read model backend health at $baseUrl. $($_.Exception.Message)"
+        if ($null -ne $_.Exception -and $_.Exception.PSObject.Properties.Name -contains "Response" -and $_.Exception.Response -and $_.Exception.Response.PSObject.Properties.Name -contains "StatusCode") {
+            $health.status_code = [int]$_.Exception.Response.StatusCode
+        }
+    }
+
+    $models = [ordered]@{
+        url = $modelsUrl
+        reachable = $false
+        status_code = $null
+        error = $null
+        models = @()
+        model_present = $false
+    }
+    try {
+        $catalogResponse = Invoke-WebRequest -Uri $modelsUrl -Method Get -TimeoutSec $RequestTimeoutSeconds -ErrorAction Stop
+        $models.status_code = [int]$catalogResponse.StatusCode
+        $models.reachable = $catalogResponse.StatusCode -ge 200 -and $catalogResponse.StatusCode -lt 300
+        if ($models.reachable) {
+            $catalogPayload = _Build-StatusPayload -Body $catalogResponse.Content
+            $catalogModels = @(_Normalize-ModelsPayload -CatalogPayload $catalogPayload)
+            if ($null -ne $catalogModels) {
+                $models.models = $catalogModels
+            }
+            $models.model_present = $catalogModels.Count -gt 0
+        } else {
+            $models.error = "Model catalog request returned status $($catalogResponse.StatusCode)"
+        }
+    } catch {
+        $models.error = "Failed to read /v1/models at $modelsUrl. $($_.Exception.Message)"
+        if ($null -ne $_.Exception -and $_.Exception.PSObject.Properties.Name -contains "Response" -and $_.Exception.Response -and $_.Exception.Response.PSObject.Properties.Name -contains "StatusCode") {
+            $models.status_code = [int]$_.Exception.Response.StatusCode
+        }
+    }
+
+    $result = [PSCustomObject]@{
+        timestamp = (Get-Date).ToUniversalTime().ToString("o")
+        host = $ModelBackendHost
+        port = $ModelBackendPort
+        health = $health
+        models = $models
+    }
+
+    if ($IncludeSession) {
+        $sessionEntries = @(
+            foreach ($entry in (_Prune-StaleModelSessions -Sessions (_Read-HarnessModelBackendSessions))) {
+                if ($entry.mode -eq "model_backend" -and $entry.host -eq $ModelBackendHost -and [int]$entry.port -eq $ModelBackendPort) {
+                    if ($entry.process_id) {
+                        $entry | Add-Member -NotePropertyName running -NotePropertyValue (
+                            [bool](Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue)
+                        ) -Force
+                    }
+                    $entry
+                }
+            }
+        )
+        $result | Add-Member -NotePropertyName session -NotePropertyValue $sessionEntries
+    }
+
+    return $result
 }
 
 function Invoke-HarnessOneShot {

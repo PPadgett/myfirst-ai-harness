@@ -11,6 +11,9 @@ import json
 
 _BACKEND_ALIASES: dict[str, str] = {
     "openai": "openai",
+    "local_openai": "openai",
+    "local-openai": "openai",
+    "localopenai": "openai",
     "auto": "auto",
     "llamacpp": "llamacpp",
     "llama_cpp": "llamacpp",

@@ -34,12 +34,17 @@ Recommended rollout controls:
 
 - Demo run:
   - `python real_ai_harness.py --query "..." --no-network`
-- Production server/local backend start:
+- Local OpenAI-compatible provider + production runtime (from-scratch, no Ollama runtime):
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
+  - `Start-HarnessModelBackend -ModelBackendPort 11435 -Model "local-foundation:v1"`
   - `Start-HarnessBackend -ExecutionMode local -Config harness.yaml -WaitSeconds 30`
-  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -UseExistingServer`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -Config harness.yaml -UseExistingServer`
+  - `Get-HarnessModelBackendStatus -IncludeSession`
+  - `Get-HarnessBackendStatus -Config harness.yaml`
   - `Stop-HarnessBackend -ExecutionMode local -Config harness.yaml`
-- Containerized NVIDIA/Ollama backend stack:
+  - `Stop-HarnessModelBackend -ModelBackendPort 11435`
+
+- Optional containerized NVIDIA/Ollama backend stack (if you need containerized providers):
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
   - `Start-HarnessBackend -ExecutionMode containerized -Config harness.yaml -EnvFile .env.nvidia`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -UseExistingServer`
@@ -76,6 +81,7 @@ Recommended rollout controls:
 Current backends are:
 
 - `openai` (default) – any OpenAI-compatible HTTP endpoint
+- `local_openai` – alias used for your own local OpenAI-compatible service (for example `harness.local_model_provider`)
 - `llamacpp` – direct local GGUF via `llama-cpp-python`
 - `nvidia_nim` (`nim`, `nvidia`, `nvidia-nim`) – NVIDIA NIM serving endpoints (local GPU or remote), including containerized local setups
 - `ollama` – Ollama OpenAI-compatible endpoint (local container or remote host)
@@ -210,26 +216,16 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/chat/completions" -Method Post 
 
 ```yaml
 backend:
-  name: openai      # openai | llamacpp | nvidia_nim | ollama | auto
+  name: local_openai      # default: your own OpenAI-compatible local provider
   # aliases also accepted: nvidia, nim, nvidia-nim
-  base_url: "http://127.0.0.1:11434/v1"
+  base_url: "http://127.0.0.1:11435/v1"
   api_key: null
   timeout_seconds: 120
   max_tokens: 768
   extra_headers: {}   # best-practice passthrough for provider-specific headers
   extra_body: {}      # best-practice passthrough for provider-specific request payloads
 
-model: "qwen2.5:7b"
-corpus_dir: "corpus"
-trace_dir: "traces"
-cache_dir: ".cache"
-enable_cache: true
-max_cache_entries: 2000
-
-tool_allowlist:
-  - "calculator"
-  - "time_now"
-  - "new_uuid"
+model: "local-foundation:v1"
 ```
 
 NVIDIA NIM example:

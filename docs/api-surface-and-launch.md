@@ -71,7 +71,7 @@ What it does:
   - `ollama`
   - `openai`
   - `auto` fallback
-- Performs startup readiness checks against provider model catalog for OpenAI-compatible providers.
+- Performs startup readiness checks against provider model catalog for configured compatibility backends.
 - Exposes endpoints:
   - `GET /health`
   - `POST /v1/chat/completions`
