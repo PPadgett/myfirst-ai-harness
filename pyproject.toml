@@ -28,3 +28,15 @@ test = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24"
 ]
+transformers = [
+  "transformers>=4.43",
+  "torch>=2.3"
+]
+llamacpp = [
+  "llama-cpp-python>=0.2.90"
+]
+local-models = [
+  "transformers>=4.43",
+  "torch>=2.3",
+  "llama-cpp-python>=0.2.90"
+]

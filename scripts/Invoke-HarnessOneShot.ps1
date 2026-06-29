@@ -5,6 +5,7 @@ $Script:HarnessBackendStateDir = Join-Path $Script:HarnessRepoRoot "state"
 $Script:HarnessBackendSessionFile = Join-Path $Script:HarnessBackendStateDir "oneshot-backend-sessions.json"
 $Script:HarnessModelBackendStateDir = Join-Path $Script:HarnessRepoRoot "state"
 $Script:HarnessModelBackendSessionFile = Join-Path $Script:HarnessModelBackendStateDir "oneshot-model-backend-sessions.json"
+$Script:HarnessLogDir = Join-Path $Script:HarnessRepoRoot "state\logs"
 $Script:HarnessModelBackendDefaultHost = "127.0.0.1"
 $Script:HarnessModelBackendDefaultPort = 11435
 $Script:HarnessModelBackendDefaultModel = "local-foundation:v1"
@@ -22,6 +23,395 @@ function _Resolve-FilePath {
         return [System.IO.Path]::GetFullPath($Path)
     }
     return [System.IO.Path]::GetFullPath((Join-Path $Base $Path))
+}
+
+function _Resolve-HarnessPythonPath {
+    param([string]$PythonPath = "")
+
+    if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
+        if ([System.IO.Path]::IsPathRooted($PythonPath) -or $PythonPath.Contains("\") -or $PythonPath.Contains("/")) {
+            return _Resolve-FilePath -Path $PythonPath -Base (Get-Location).Path
+        }
+        return $PythonPath
+    }
+
+    $venvPython = Join-Path $Script:HarnessRepoRoot ".venv\Scripts\python.exe"
+    if (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+        return $venvPython
+    }
+    return "python"
+}
+
+function _Format-HarnessCommand {
+    param(
+        [string]$Executable,
+        [string[]]$Arguments
+    )
+
+    $parts = @($Executable) + @($Arguments)
+    return ($parts | ForEach-Object {
+            $part = [string]$_
+            if ($part -match '\s') {
+                '"' + $part.Replace('"', '\"') + '"'
+            } else {
+                $part
+            }
+        }) -join " "
+}
+
+function _New-HarnessLogPaths {
+    param([string]$Prefix)
+
+    if (-not (Test-Path -LiteralPath $Script:HarnessLogDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $Script:HarnessLogDir -Force | Out-Null
+    }
+    $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffZ")
+    $id = [System.Guid]::NewGuid().ToString("N").Substring(0, 8)
+    $safePrefix = ([string]$Prefix) -replace '[^a-zA-Z0-9_.-]', '-'
+    return [PSCustomObject]@{
+        stdout_log = Join-Path $Script:HarnessLogDir "$safePrefix-$stamp-$id.stdout.log"
+        stderr_log = Join-Path $Script:HarnessLogDir "$safePrefix-$stamp-$id.stderr.log"
+    }
+}
+
+function _Join-HarnessPathParts {
+    param(
+        [string]$Root,
+        [string[]]$Parts
+    )
+
+    $current = $Root
+    foreach ($part in $Parts) {
+        if ([string]::IsNullOrWhiteSpace($part)) {
+            continue
+        }
+        $current = Join-Path $current $part
+    }
+    return $current
+}
+
+function _Get-HarnessCandidateModelRoots {
+    param([string]$ModelsRoot)
+
+    $roots = @()
+    if (-not [string]::IsNullOrWhiteSpace($ModelsRoot)) {
+        $roots += _Resolve-FilePath -Path $ModelsRoot -Base (Get-Location).Path
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:OLLAMA_MODELS)) {
+        $roots += _Resolve-FilePath -Path $env:OLLAMA_MODELS -Base (Get-Location).Path
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $roots += (Join-Path $env:USERPROFILE ".ollama\models")
+    }
+
+    $unique = @()
+    $seen = @{}
+    foreach ($root in $roots) {
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            continue
+        }
+        $key = [string]$root
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+        $seen[$key] = $true
+        $unique += $root
+    }
+    return $unique
+}
+
+function _Get-HarnessCandidateHuggingFaceCacheRoots {
+    $roots = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:HF_HUB_CACHE)) {
+        $roots += _Resolve-FilePath -Path $env:HF_HUB_CACHE -Base (Get-Location).Path
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:HUGGINGFACE_HUB_CACHE)) {
+        $roots += _Resolve-FilePath -Path $env:HUGGINGFACE_HUB_CACHE -Base (Get-Location).Path
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:HF_HOME)) {
+        $roots += (Join-Path (_Resolve-FilePath -Path $env:HF_HOME -Base (Get-Location).Path) "hub")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $roots += (Join-Path $env:USERPROFILE ".cache\huggingface\hub")
+    }
+
+    $unique = @()
+    $seen = @{}
+    foreach ($root in $roots) {
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            continue
+        }
+        $key = [string]$root
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+        $seen[$key] = $true
+        $unique += $root
+    }
+    return $unique
+}
+
+function _Resolve-HarnessHuggingFaceCacheDir {
+    param([string]$Model)
+
+    $modelId = $Model.Trim()
+    if ($modelId -match "(?i)^hf://") {
+        $modelId = $modelId.Substring(5)
+    }
+    if ([string]::IsNullOrWhiteSpace($modelId) -or -not $modelId.Contains("/")) {
+        return $null
+    }
+    $cacheName = "models--" + $modelId.Replace("/", "--")
+    foreach ($root in (_Get-HarnessCandidateHuggingFaceCacheRoots)) {
+        $candidate = Join-Path $root $cacheName
+        if (Test-Path -LiteralPath $candidate -PathType Container) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function _Test-HarnessHuggingFaceCacheHasWeights {
+    param([string]$CacheDir)
+
+    if ([string]::IsNullOrWhiteSpace($CacheDir) -or -not (Test-Path -LiteralPath $CacheDir -PathType Container)) {
+        return $false
+    }
+    $snapshots = Join-Path $CacheDir "snapshots"
+    $searchRoot = if (Test-Path -LiteralPath $snapshots -PathType Container) { $snapshots } else { $CacheDir }
+    foreach ($pattern in @("*.safetensors", "*.bin", "*.pt", "*.pth")) {
+        $found = Get-ChildItem -LiteralPath $searchRoot -Recurse -File -Filter $pattern -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $found) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function _Get-HarnessOllamaModelParts {
+    param([string]$Model)
+
+    $name = $Model.Trim()
+    $tag = "latest"
+    $namePart = $name
+    $lastColon = $name.LastIndexOf(":")
+    if ($lastColon -gt 0) {
+        $namePart = $name.Substring(0, $lastColon)
+        $tag = $name.Substring($lastColon + 1)
+        if ([string]::IsNullOrWhiteSpace($tag)) {
+            $tag = "latest"
+        }
+    }
+
+    $parts = @($namePart.Trim("/") -split "/" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($parts.Count -eq 1) {
+        $parts = @("registry.ollama.ai", "library", $parts[0])
+    } elseif ($parts.Count -eq 2) {
+        $parts = @("registry.ollama.ai", $parts[0], $parts[1])
+    }
+
+    return [PSCustomObject]@{
+        parts = $parts
+        tag = $tag
+    }
+}
+
+function _Resolve-HarnessOllamaStoreSource {
+    param(
+        [string]$Model,
+        [string]$ModelsRoot
+    )
+
+    $empty = [ordered]@{
+        resolved = $false
+        source = $null
+        source_type = $null
+        artifact_format = $null
+        provider_store = $null
+        manifest_path = $null
+        generation_backend = $null
+    }
+    $modelParts = _Get-HarnessOllamaModelParts -Model $Model
+    foreach ($root in (_Get-HarnessCandidateModelRoots -ModelsRoot $ModelsRoot)) {
+        $manifest = _Join-HarnessPathParts -Root (Join-Path $root "manifests") -Parts (@($modelParts.parts) + @($modelParts.tag))
+        if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            continue
+        }
+        try {
+            $payload = Get-Content -LiteralPath $manifest -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            continue
+        }
+
+        $layers = @()
+        if ($payload.PSObject.Properties.Name -contains "layers") {
+            $layers = @($payload.layers)
+        }
+        $modelLayers = @($layers | Where-Object {
+            $_ -and $_.PSObject.Properties.Name -contains "mediaType" -and ([string]$_.mediaType).ToLowerInvariant().Contains("model")
+        })
+        if ($modelLayers.Count -eq 0) {
+            $modelLayers = @($layers)
+        }
+
+        foreach ($layer in $modelLayers) {
+            if ($null -eq $layer -or -not ($layer.PSObject.Properties.Name -contains "digest")) {
+                continue
+            }
+            $digest = ([string]$layer.digest).Trim()
+            if (-not $digest.StartsWith("sha256:")) {
+                continue
+            }
+            $blob = Join-Path (Join-Path $root "blobs") ($digest.Replace(":", "-"))
+            if (-not (Test-Path -LiteralPath $blob -PathType Leaf)) {
+                continue
+            }
+            return [ordered]@{
+                resolved = $true
+                source = $blob
+                source_type = "ollama_store"
+                artifact_format = "gguf"
+                provider_store = "ollama"
+                manifest_path = $manifest
+                generation_backend = "llamacpp"
+            }
+        }
+    }
+    return $empty
+}
+
+function _Resolve-HarnessFilesystemModelSource {
+    param(
+        [string]$Model,
+        [string]$ModelsRoot
+    )
+
+    $empty = [ordered]@{
+        resolved = $false
+        source = $null
+        source_type = $null
+        artifact_format = $null
+        provider_store = $null
+        manifest_path = $null
+        generation_backend = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($ModelsRoot)) {
+        return $empty
+    }
+    $root = _Resolve-FilePath -Path $ModelsRoot -Base (Get-Location).Path
+    if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+        return $empty
+    }
+
+    $candidates = @()
+    $candidates += (Join-Path $root $Model)
+    $candidates += (Join-Path $root ($Model.Replace(":", "_").Replace("/", [System.IO.Path]::DirectorySeparatorChar)))
+    $lastColon = $Model.LastIndexOf(":")
+    if ($lastColon -gt 0) {
+        $name = $Model.Substring(0, $lastColon)
+        $tag = $Model.Substring($lastColon + 1)
+        $candidates += (Join-Path (Join-Path $root $name) $tag)
+        $candidates += (Join-Path $root $name)
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $artifact = if ($candidate.ToLowerInvariant().EndsWith(".gguf")) { "gguf" } else { "transformers" }
+            return [ordered]@{
+                resolved = $true
+                source = $candidate
+                source_type = "models_root"
+                artifact_format = $artifact
+                provider_store = $null
+                manifest_path = $null
+                generation_backend = if ($artifact -eq "gguf") { "llamacpp" } else { "transformers" }
+            }
+        }
+        if (Test-Path -LiteralPath $candidate -PathType Container) {
+            $config = Join-Path $candidate "config.json"
+            if (Test-Path -LiteralPath $config -PathType Leaf) {
+                return [ordered]@{
+                    resolved = $true
+                    source = $candidate
+                    source_type = "models_root"
+                    artifact_format = "transformers"
+                    provider_store = $null
+                    manifest_path = $null
+                    generation_backend = "transformers"
+                }
+            }
+            $gguf = @(Get-ChildItem -LiteralPath $candidate -Filter "*.gguf" -File -ErrorAction SilentlyContinue)
+            if ($gguf.Count -eq 1) {
+                return [ordered]@{
+                    resolved = $true
+                    source = $gguf[0].FullName
+                    source_type = "models_root"
+                    artifact_format = "gguf"
+                    provider_store = $null
+                    manifest_path = $null
+                    generation_backend = "llamacpp"
+                }
+            }
+        }
+    }
+    return $empty
+}
+
+function _Resolve-HarnessModelBackendSource {
+    param(
+        [string]$Model,
+        [string]$ModelPath,
+        [string]$ModelsRoot
+    )
+
+    $empty = [ordered]@{
+        resolved = $false
+        source = $null
+        source_type = $null
+        artifact_format = $null
+        provider_store = $null
+        manifest_path = $null
+        generation_backend = $null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ModelPath)) {
+        $resolvedPath = _Resolve-FilePath -Path $ModelPath -Base (Get-Location).Path
+        $artifact = if ($resolvedPath.ToLowerInvariant().EndsWith(".gguf")) { "gguf" } else { "transformers" }
+        return [ordered]@{
+            resolved = [bool](Test-Path -LiteralPath $resolvedPath)
+            source = $resolvedPath
+            source_type = "filesystem"
+            artifact_format = $artifact
+            provider_store = $null
+            manifest_path = $null
+            generation_backend = if ($artifact -eq "gguf") { "llamacpp" } else { "transformers" }
+        }
+    }
+
+    if ($Model -match "(?i)^hf://") {
+        $cacheDir = _Resolve-HarnessHuggingFaceCacheDir -Model $Model
+        return [ordered]@{
+            resolved = $true
+            source = $Model.Substring(5)
+            source_type = "huggingface_cache"
+            artifact_format = "transformers"
+            provider_store = "huggingface"
+            manifest_path = $cacheDir
+            generation_backend = "transformers"
+        }
+    }
+
+    $filesystem = _Resolve-HarnessFilesystemModelSource -Model $Model -ModelsRoot $ModelsRoot
+    if ([bool]$filesystem.resolved) {
+        return $filesystem
+    }
+
+    $ollama = _Resolve-HarnessOllamaStoreSource -Model $Model -ModelsRoot $ModelsRoot
+    if ([bool]$ollama.resolved) {
+        return $ollama
+    }
+
+    return $empty
 }
 
 function _Read-HarnessBackendSessions {
@@ -286,6 +676,200 @@ function _Build-StatusPayload {
     }
 }
 
+function _Get-HarnessNamedProperty {
+    param(
+        [object]$InputObject,
+        [string[]]$Names
+    )
+
+    if ($null -eq $InputObject -or $null -eq $Names) {
+        return $null
+    }
+    foreach ($name in $Names) {
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+        if ($InputObject -is [System.Collections.IDictionary] -and $InputObject.Contains($name)) {
+            return $InputObject[$name]
+        }
+        if ($InputObject.PSObject -and $InputObject.PSObject.Properties.Name -contains $name) {
+            return $InputObject.PSObject.Properties[$name].Value
+        }
+    }
+    return $null
+}
+
+function _Convert-HarnessBoolean {
+    param([object]$Value)
+
+    if ($null -eq $Value) {
+        return $false
+    }
+    if ($Value -is [bool]) {
+        return [bool]$Value
+    }
+    $text = ([string]$Value).Trim().ToLowerInvariant()
+    return $text -in @("1", "true", "yes", "on")
+}
+
+function _Get-ModelCatalogEntries {
+    param([object]$CatalogPayload)
+
+    if ($null -eq $CatalogPayload) {
+        return @()
+    }
+
+    $collection = $CatalogPayload
+    if ($CatalogPayload.PSObject -and $CatalogPayload.PSObject.Properties.Name -contains "data") {
+        $collection = $CatalogPayload.data
+    } elseif ($CatalogPayload.PSObject -and $CatalogPayload.PSObject.Properties.Name -contains "models") {
+        $collection = $CatalogPayload.models
+    }
+
+    if ($null -eq $collection -or $collection -is [string] -or $collection -isnot [System.Collections.IEnumerable]) {
+        return @()
+    }
+    return @($collection)
+}
+
+function _Get-ModelCatalogEntry {
+    param(
+        [object]$CatalogPayload,
+        [string]$ModelName = ""
+    )
+
+    $entries = @(_Get-ModelCatalogEntries -CatalogPayload $CatalogPayload)
+    if ($entries.Count -eq 0) {
+        return $null
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ModelName)) {
+        $expected = $ModelName.Trim().ToLowerInvariant().Replace(" ", "")
+        foreach ($entry in $entries) {
+            $name = _Get-HarnessNamedProperty -InputObject $entry -Names @("id", "name", "model")
+            if ($null -ne $name -and ([string]$name).Trim().ToLowerInvariant().Replace(" ", "") -eq $expected) {
+                return $entry
+            }
+        }
+    }
+    return $entries[0]
+}
+
+function _Get-ProviderDiagnosticsFromPayloads {
+    param(
+        [object]$HealthPayload,
+        [object]$ModelEntry
+    )
+
+    $configuredBackend = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("configured_backend", "backend")
+    if ($null -eq $configuredBackend) {
+        $configuredBackend = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("configured_backend", "backend")
+    }
+    $generationBackend = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("generation_backend")
+    if ($null -eq $generationBackend) {
+        $generationBackend = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("generation_backend")
+    }
+    $modelSource = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("model_source", "source")
+    if ($null -eq $modelSource) {
+        $modelSource = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("model_source", "source")
+    }
+    $modelSourceType = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("model_source_type", "source_type")
+    if ($null -eq $modelSourceType) {
+        $modelSourceType = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("model_source_type", "source_type")
+    }
+    $modelArtifactFormat = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("model_artifact_format", "artifact_format")
+    if ($null -eq $modelArtifactFormat) {
+        $modelArtifactFormat = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("model_artifact_format", "artifact_format")
+    }
+    $providerStore = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("provider_store")
+    if ($null -eq $providerStore) {
+        $providerStore = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("provider_store")
+    }
+    $manifestPath = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("manifest_path")
+    if ($null -eq $manifestPath) {
+        $manifestPath = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("manifest_path")
+    }
+    $runtimeDependency = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("runtime_dependency")
+    if ($null -eq $runtimeDependency) {
+        $runtimeDependency = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("runtime_dependency")
+    }
+    $runtimeDependencyAvailable = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("runtime_dependency_available")
+    if ($null -eq $runtimeDependencyAvailable) {
+        $runtimeDependencyAvailable = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("runtime_dependency_available")
+    }
+    $localModelLoaded = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("local_model_loaded")
+    if ($null -eq $localModelLoaded) {
+        $localModelLoaded = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("local_model_loaded")
+    }
+    $modelSourcePresent = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("model_source_present")
+    if ($null -eq $modelSourcePresent) {
+        $modelSourcePresent = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("model_source_present")
+    }
+    $modelLoadAttempted = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("model_load_attempted")
+    if ($null -eq $modelLoadAttempted) {
+        $modelLoadAttempted = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("model_load_attempted")
+    }
+    $modelLoadSucceeded = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("model_load_succeeded")
+    if ($null -eq $modelLoadSucceeded) {
+        $modelLoadSucceeded = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("model_load_succeeded")
+    }
+    $lastLoadError = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("last_load_error")
+    if ($null -eq $lastLoadError) {
+        $lastLoadError = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("last_load_error")
+    }
+    $lastGenerationError = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("last_generation_error")
+    if ($null -eq $lastGenerationError) {
+        $lastGenerationError = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("last_generation_error")
+    }
+    $templateApplied = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("template_applied")
+    if ($null -eq $templateApplied) {
+        $templateApplied = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("template_applied")
+    }
+    $finishReason = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("finish_reason")
+    if ($null -eq $finishReason) {
+        $finishReason = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("finish_reason")
+    }
+    $truncated = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("truncated")
+    if ($null -eq $truncated) {
+        $truncated = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("truncated")
+    }
+    $reasoningExtracted = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("reasoning_extracted")
+    if ($null -eq $reasoningExtracted) {
+        $reasoningExtracted = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("reasoning_extracted")
+    }
+    $fallbackActive = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("fallback_active")
+    if ($null -eq $fallbackActive) {
+        $fallbackActive = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("fallback_active")
+    }
+    $providerWarning = _Get-HarnessNamedProperty -InputObject $HealthPayload -Names @("provider_warning", "warning")
+    if ($null -eq $providerWarning) {
+        $providerWarning = _Get-HarnessNamedProperty -InputObject $ModelEntry -Names @("provider_warning", "warning")
+    }
+
+    return [ordered]@{
+        configured_backend = if ($null -eq $configuredBackend) { $null } else { [string]$configuredBackend }
+        generation_backend = if ($null -eq $generationBackend) { $null } else { [string]$generationBackend }
+        model_source = if ($null -eq $modelSource) { $null } else { [string]$modelSource }
+        model_source_type = if ($null -eq $modelSourceType) { $null } else { [string]$modelSourceType }
+        model_artifact_format = if ($null -eq $modelArtifactFormat) { $null } else { [string]$modelArtifactFormat }
+        provider_store = if ($null -eq $providerStore) { $null } else { [string]$providerStore }
+        manifest_path = if ($null -eq $manifestPath) { $null } else { [string]$manifestPath }
+        runtime_dependency = if ($null -eq $runtimeDependency) { $null } else { [string]$runtimeDependency }
+        runtime_dependency_available = _Convert-HarnessBoolean -Value $runtimeDependencyAvailable
+        local_model_loaded = _Convert-HarnessBoolean -Value $localModelLoaded
+        model_source_present = _Convert-HarnessBoolean -Value $modelSourcePresent
+        model_load_attempted = _Convert-HarnessBoolean -Value $modelLoadAttempted
+        model_load_succeeded = _Convert-HarnessBoolean -Value $modelLoadSucceeded
+        last_load_error = if ($null -eq $lastLoadError) { $null } else { [string]$lastLoadError }
+        last_generation_error = if ($null -eq $lastGenerationError) { $null } else { [string]$lastGenerationError }
+        template_applied = _Convert-HarnessBoolean -Value $templateApplied
+        finish_reason = if ($null -eq $finishReason) { $null } else { [string]$finishReason }
+        truncated = _Convert-HarnessBoolean -Value $truncated
+        reasoning_extracted = _Convert-HarnessBoolean -Value $reasoningExtracted
+        fallback_active = _Convert-HarnessBoolean -Value $fallbackActive
+        provider_warning = if ($null -eq $providerWarning) { $null } else { [string]$providerWarning }
+    }
+}
+
 function _Get-HarnessPropertyValue {
     param(
         [object]$InputObject,
@@ -474,10 +1058,27 @@ function _Add-HarnessOneShotConvenience {
     } else {
         $Response | Add-Member -NotePropertyName answer -NotePropertyValue $answer -Force
     }
+    $provider = _Get-HarnessPropertyValue -InputObject $Response -Path "meta.provider"
+    if ($null -eq $provider) {
+        $provider = _Get-HarnessNamedProperty -InputObject $Response -Names @("provider")
+    }
+    if ($null -ne $provider) {
+        foreach ($field in @("configured_backend", "generation_backend", "model_source", "model_source_type", "model_artifact_format", "provider_store", "manifest_path", "runtime_dependency", "runtime_dependency_available", "local_model_loaded", "model_source_present", "model_load_attempted", "model_load_succeeded", "last_load_error", "last_generation_error", "template_applied", "fallback_active", "allow_fallback", "finish_reason", "truncated", "reasoning_extracted", "warnings", "provider_warning")) {
+            $value = _Get-HarnessNamedProperty -InputObject $provider -Names @($field)
+            if ($null -eq $value -and $Response.PSObject.Properties.Name -contains $field) {
+                continue
+            }
+            if ($Response.PSObject.Properties.Name -contains $field) {
+                $Response.$field = $value
+            } else {
+                $Response | Add-Member -NotePropertyName $field -NotePropertyValue $value -Force
+            }
+        }
+    }
     return _Add-HarnessTypeName `
         -InputObject $Response `
         -TypeName "Harness.OneShot.Response" `
-        -DefaultDisplayPropertySet @("answer", "status", "model", "route", "run_id", "next_action")
+        -DefaultDisplayPropertySet @("answer", "status", "model", "route", "generation_backend", "finish_reason", "truncated", "provider_warning", "run_id", "next_action")
 }
 
 function _Get-ExceptionResponse {
@@ -690,6 +1291,12 @@ function _Format-ListenerConflictMessage {
     return "Cannot bind to port $Port because it is already in use."
 }
 
+<#
+.SYNOPSIS
+Gets runtime and provider-plane backend status.
+.DESCRIPTION
+Returns scalar diagnostics plus nested health, model catalog, and optional session details for pipeline inspection.
+#>
 function Get-HarnessBackendStatus {
     [CmdletBinding()]
     param(
@@ -724,6 +1331,29 @@ function Get-HarnessBackendStatus {
         error = $null
         model_present_in_catalog = $false
         catalog_models = @()
+        catalog_payload = $null
+        model_entry = $null
+        configured_backend = $null
+        generation_backend = $null
+        model_source = $null
+        model_source_type = $null
+        model_artifact_format = $null
+        provider_store = $null
+        manifest_path = $null
+        runtime_dependency = $null
+        runtime_dependency_available = $false
+        local_model_loaded = $false
+        model_source_present = $false
+        model_load_attempted = $false
+        model_load_succeeded = $false
+        last_load_error = $null
+        last_generation_error = $null
+        template_applied = $false
+        finish_reason = $null
+        truncated = $false
+        reasoning_extracted = $false
+        fallback_active = $false
+        provider_warning = $null
     }
 
     $status = [ordered]@{
@@ -739,6 +1369,27 @@ function Get-HarnessBackendStatus {
         provider_status_code = $null
         provider_error = $null
         model_present_in_catalog = $false
+        configured_backend = $null
+        generation_backend = $null
+        model_source = $null
+        model_source_type = $null
+        model_artifact_format = $null
+        provider_store = $null
+        manifest_path = $null
+        runtime_dependency = $null
+        runtime_dependency_available = $false
+        local_model_loaded = $false
+        model_source_present = $false
+        model_load_attempted = $false
+        model_load_succeeded = $false
+        last_load_error = $null
+        last_generation_error = $null
+        template_applied = $false
+        finish_reason = $null
+        truncated = $false
+        reasoning_extracted = $false
+        fallback_active = $false
+        provider_warning = $null
         server = [ordered]@{
             url = $healthUrl
             reachable = $false
@@ -786,6 +1437,30 @@ function Get-HarnessBackendStatus {
                 if ($null -eq $catalogModels) {
                     $catalogModels = @()
                 }
+                $status.provider_plane.catalog_payload = $catalogPayload
+                $status.provider_plane.model_entry = _Get-ModelCatalogEntry -CatalogPayload $catalogPayload -ModelName $backendModel
+                $diagnostics = _Get-ProviderDiagnosticsFromPayloads -HealthPayload $null -ModelEntry $status.provider_plane.model_entry
+                $status.provider_plane.configured_backend = $diagnostics.configured_backend
+                $status.provider_plane.generation_backend = $diagnostics.generation_backend
+                $status.provider_plane.model_source = $diagnostics.model_source
+                $status.provider_plane.model_source_type = $diagnostics.model_source_type
+                $status.provider_plane.model_artifact_format = $diagnostics.model_artifact_format
+                $status.provider_plane.provider_store = $diagnostics.provider_store
+                $status.provider_plane.manifest_path = $diagnostics.manifest_path
+                $status.provider_plane.runtime_dependency = $diagnostics.runtime_dependency
+                $status.provider_plane.runtime_dependency_available = [bool]$diagnostics.runtime_dependency_available
+                $status.provider_plane.local_model_loaded = [bool]$diagnostics.local_model_loaded
+                $status.provider_plane.model_source_present = [bool]$diagnostics.model_source_present
+                $status.provider_plane.model_load_attempted = [bool]$diagnostics.model_load_attempted
+                $status.provider_plane.model_load_succeeded = [bool]$diagnostics.model_load_succeeded
+                $status.provider_plane.last_load_error = $diagnostics.last_load_error
+                $status.provider_plane.last_generation_error = $diagnostics.last_generation_error
+                $status.provider_plane.template_applied = [bool]$diagnostics.template_applied
+                $status.provider_plane.finish_reason = $diagnostics.finish_reason
+                $status.provider_plane.truncated = [bool]$diagnostics.truncated
+                $status.provider_plane.reasoning_extracted = [bool]$diagnostics.reasoning_extracted
+                $status.provider_plane.fallback_active = [bool]$diagnostics.fallback_active
+                $status.provider_plane.provider_warning = $diagnostics.provider_warning
                 if ($catalogModels.Count -eq 0 -and $catalogPayload -isnot [string]) {
                     # if payload parsing fails partially, keep diagnostics in model list for auditability
                     try {
@@ -859,6 +1534,27 @@ function Get-HarnessBackendStatus {
     $status.provider_status_code = $status.provider_plane.status_code
     $status.provider_error = $status.provider_plane.error
     $status.model_present_in_catalog = [bool]$status.provider_plane.model_present_in_catalog
+    $status.configured_backend = $status.provider_plane.configured_backend
+    $status.generation_backend = $status.provider_plane.generation_backend
+    $status.model_source = $status.provider_plane.model_source
+    $status.model_source_type = $status.provider_plane.model_source_type
+    $status.model_artifact_format = $status.provider_plane.model_artifact_format
+    $status.provider_store = $status.provider_plane.provider_store
+    $status.manifest_path = $status.provider_plane.manifest_path
+    $status.runtime_dependency = $status.provider_plane.runtime_dependency
+    $status.runtime_dependency_available = [bool]$status.provider_plane.runtime_dependency_available
+    $status.local_model_loaded = [bool]$status.provider_plane.local_model_loaded
+    $status.model_source_present = [bool]$status.provider_plane.model_source_present
+    $status.model_load_attempted = [bool]$status.provider_plane.model_load_attempted
+    $status.model_load_succeeded = [bool]$status.provider_plane.model_load_succeeded
+    $status.last_load_error = $status.provider_plane.last_load_error
+    $status.last_generation_error = $status.provider_plane.last_generation_error
+    $status.template_applied = [bool]$status.provider_plane.template_applied
+    $status.finish_reason = $status.provider_plane.finish_reason
+    $status.truncated = [bool]$status.provider_plane.truncated
+    $status.reasoning_extracted = [bool]$status.provider_plane.reasoning_extracted
+    $status.fallback_active = [bool]$status.provider_plane.fallback_active
+    $status.provider_warning = $status.provider_plane.provider_warning
 
     $result = _New-HarnessObject `
         -TypeName "Harness.Backend.Status" `
@@ -869,8 +1565,20 @@ function Get-HarnessBackendStatus {
             "runtime_reachable",
             "provider_reachable",
             "model_present_in_catalog",
+            "generation_backend",
+            "model_source_type",
+            "model_artifact_format",
+            "provider_store",
+            "runtime_dependency_available",
+            "model_source_present",
+            "model_load_attempted",
+            "model_load_succeeded",
+            "template_applied",
+            "truncated",
+            "fallback_active",
             "runtime_error",
-            "provider_error"
+            "provider_error",
+            "provider_warning"
         )
     return _Apply-HarnessOutputOptions `
         -InputObject $result `
@@ -880,8 +1588,14 @@ function Get-HarnessBackendStatus {
         -JsonDepth $JsonDepth
 }
 
+<#
+.SYNOPSIS
+Starts the harness runtime backend.
+.DESCRIPTION
+Starts the local Python runtime or the configured container profile and returns a rich object for pipeline use.
+#>
 function Start-HarnessBackend {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "Medium")]
     param(
         [Parameter(Position = 0)]
         [ValidateSet("local", "containerized")]
@@ -890,6 +1604,7 @@ function Start-HarnessBackend {
         [string]$Config = "harness.yaml",
         [string]$ServerHost = "127.0.0.1",
         [int]$Port = 8080,
+        [string]$PythonPath = "",
         [string]$ContainerProfile = "",
         [string]$ComposeFile = "docker-compose.nvidia.yaml",
         [string]$EnvFile = "",
@@ -913,6 +1628,7 @@ function Start-HarnessBackend {
 
     $healthUrl = _HealthUrl -TargetHost $ServerHost -Port $Port
     if ($ExecutionMode -eq "local") {
+        $resolvedPythonPath = _Resolve-HarnessPythonPath -PythonPath $PythonPath
         $startArgs = @(
             "-m",
             "harness.server",
@@ -923,7 +1639,7 @@ function Start-HarnessBackend {
             "--port",
             $Port.ToString()
         )
-        $command = "python $($startArgs -join ' ')"
+        $command = _Format-HarnessCommand -Executable $resolvedPythonPath -Arguments $startArgs
         $entryKey = _Session-Key -Mode "local" -ConfigPath $resolvedConfig -ServerHost $ServerHost -Port $Port -Profile ""
 
         $existingSessions = _Prune-StaleSessions -Sessions (_Read-HarnessBackendSessions)
@@ -941,9 +1657,12 @@ function Start-HarnessBackend {
                 config = $resolvedConfig
                 host = $ServerHost
                 port = $Port
+                python_path = if ($runningSession.PSObject.Properties.Name -contains "python_path") { $runningSession.python_path } else { $resolvedPythonPath }
                 command = $command
                 health_url = $healthUrl
                 process_id = [int]$runningSession.process_id
+                stdout_log = if ($runningSession.PSObject.Properties.Name -contains "stdout_log") { $runningSession.stdout_log } else { $null }
+                stderr_log = if ($runningSession.PSObject.Properties.Name -contains "stderr_log") { $runningSession.stderr_log } else { $null }
                 session_file = $Script:HarnessBackendSessionFile
             }
             return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
@@ -978,6 +1697,7 @@ function Start-HarnessBackend {
                 config = $resolvedConfig
                 host = $ServerHost
                 port = $Port
+                python_path = $resolvedPythonPath
                 command = $command
                 health_url = $healthUrl
                 session_file = $Script:HarnessBackendSessionFile
@@ -985,18 +1705,32 @@ function Start-HarnessBackend {
             return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
         }
 
-        $stdoutPath = [System.IO.Path]::GetTempFileName()
-        $stderrPath = [System.IO.Path]::GetTempFileName()
+        $logPaths = _New-HarnessLogPaths -Prefix "runtime-$Port"
+        $stdoutPath = [string]$logPaths.stdout_log
+        $stderrPath = [string]$logPaths.stderr_log
+        if (-not $PSCmdlet.ShouldProcess("$ServerHost`:$Port", "Start harness runtime backend")) {
+            $result = _New-HarnessObject -TypeName "Harness.Backend.StartResult" -DefaultDisplayPropertySet @("mode", "action", "started", "host", "port", "health_url") -Property @{
+                mode = "local"
+                started = $false
+                action = "whatif"
+                config = $resolvedConfig
+                host = $ServerHost
+                port = $Port
+                python_path = $resolvedPythonPath
+                command = $command
+                health_url = $healthUrl
+                stdout_log = $stdoutPath
+                stderr_log = $stderrPath
+                session_file = $Script:HarnessBackendSessionFile
+            }
+            return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
+        }
         try {
-            $process = Start-Process -FilePath "python" -ArgumentList $startArgs -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+            $process = Start-Process -FilePath $resolvedPythonPath -ArgumentList $startArgs -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
         } catch {
-            if (Test-Path $stdoutPath) { Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue }
-            if (Test-Path $stderrPath) { Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue }
             throw "Failed to start harness server process."
         }
         if ($null -eq $process) {
-            if (Test-Path $stdoutPath) { Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue }
-            if (Test-Path $stderrPath) { Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue }
             throw "Failed to start harness server process."
         }
         if ($process.HasExited) {
@@ -1004,8 +1738,6 @@ function Start-HarnessBackend {
             if (Test-Path $stderrPath) {
                 $startupError = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
             }
-            if (Test-Path $stdoutPath) { Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue }
-            if (Test-Path $stderrPath) { Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue }
             throw "Harness server exited immediately with code $($process.ExitCode). $startupError"
         }
 
@@ -1014,13 +1746,9 @@ function Start-HarnessBackend {
             if (Test-Path $stderrPath) {
                 $startupError = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
             }
-            if (Test-Path $stdoutPath) { Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue }
-            if (Test-Path $stderrPath) { Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue }
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
             throw "Harness server at $($healthUrl) did not become ready after ${WaitSeconds}s. $startupError"
         }
-        if (Test-Path $stdoutPath) { Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue }
-        if (Test-Path $stderrPath) { Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue }
 
         $entry = @{
             key = $entryKey
@@ -1029,8 +1757,11 @@ function Start-HarnessBackend {
             config = $resolvedConfig
             host = $ServerHost
             port = $Port
+            python_path = $resolvedPythonPath
             command = $command
             health_url = $healthUrl
+            stdout_log = $stdoutPath
+            stderr_log = $stderrPath
             started_utc = (Get-Date).ToUniversalTime().ToString("o")
         }
 
@@ -1044,9 +1775,12 @@ function Start-HarnessBackend {
             config = $resolvedConfig
             host = $ServerHost
             port = $Port
+            python_path = $resolvedPythonPath
             command = $command
             health_url = $healthUrl
             process_id = $process.Id
+            stdout_log = $stdoutPath
+            stderr_log = $stderrPath
             session_file = $Script:HarnessBackendSessionFile
         }
         return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
@@ -1097,11 +1831,27 @@ function Start-HarnessBackend {
     }
     $composeArgs += "-d"
 
-    $command = "docker $($composeArgs -join ' ')"
+    $command = _Format-HarnessCommand -Executable "docker" -Arguments $composeArgs
     if ($DryRun) {
         $result = _New-HarnessObject -TypeName "Harness.Backend.StartResult" -DefaultDisplayPropertySet @("mode", "started", "profile", "config", "health_url") -Property @{
             mode = "containerized"
             started = $false
+            profile = $profile
+            config = $resolvedConfig
+            compose_file = $resolvedCompose
+            env_file = $resolvedEnvFile
+            command = $command
+            health_url = $healthUrl
+            session_file = $Script:HarnessBackendSessionFile
+        }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($resolvedConfig, "Start harness container backend")) {
+        $result = _New-HarnessObject -TypeName "Harness.Backend.StartResult" -DefaultDisplayPropertySet @("mode", "action", "started", "profile", "config", "health_url") -Property @{
+            mode = "containerized"
+            started = $false
+            action = "whatif"
             profile = $profile
             config = $resolvedConfig
             compose_file = $resolvedCompose
@@ -1154,8 +1904,14 @@ function Start-HarnessBackend {
     return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
 }
 
+<#
+.SYNOPSIS
+Stops tracked harness runtime backends.
+.DESCRIPTION
+Stops local runtime processes or the configured container stack and returns the targeted sessions.
+#>
 function Stop-HarnessBackend {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "Medium")]
     param(
         [Parameter(Position = 0)]
         [ValidateSet("local", "containerized")]
@@ -1204,6 +1960,7 @@ function Stop-HarnessBackend {
     )
 
     if ($ExecutionMode -eq "local") {
+        $shouldStopLocal = $DryRun.IsPresent -or $PSCmdlet.ShouldProcess("$ServerHost`:$Port", "Stop harness runtime backend")
         foreach ($entry in $sessions) {
             if ($entry.mode -ne "local") {
                 $remaining += $entry
@@ -1217,7 +1974,10 @@ function Stop-HarnessBackend {
             }
 
             $removed += $entry
-            if ($DryRun) {
+            if ($DryRun -or -not $shouldStopLocal) {
+                if (-not $DryRun) {
+                    $remaining += $entry
+                }
                 continue
             }
             if ($entry.process_id) {
@@ -1227,10 +1987,10 @@ function Stop-HarnessBackend {
             }
         }
 
-        if ($DryRun) {
+        if ($DryRun -or -not $shouldStopLocal) {
             $result = _New-HarnessObject -TypeName "Harness.Backend.StopResult" -DefaultDisplayPropertySet @("mode", "action", "removed_count") -Property @{
                 mode = "local"
-                action = "stopped"
+                action = if ($DryRun) { "stopped" } else { "whatif" }
                 removed_count = $removed.Count
                 removed = $removed
             }
@@ -1309,6 +2069,20 @@ function Stop-HarnessBackend {
         }
     }
 
+    if (-not $PSCmdlet.ShouldProcess($resolvedConfig, "Stop harness container backend")) {
+        $result = _New-HarnessObject -TypeName "Harness.Backend.StopResult" -DefaultDisplayPropertySet @("mode", "action", "removed_count", "profile", "config") -Property @{
+            mode = "containerized"
+            action = "whatif"
+            removed_count = $removed.Count
+            command = $command
+            profile = $profile
+            config = $resolvedConfig
+            compose_file = $resolvedCompose
+            env_file = $resolvedEnvFile
+        }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
+    }
+
     $compose = Start-Process -FilePath "docker" -ArgumentList $composeArgs -PassThru -NoNewWindow -Wait
     if ($compose.ExitCode -ne 0) {
         throw "docker compose stop failed with exit code $($compose.ExitCode)"
@@ -1328,21 +2102,32 @@ function Stop-HarnessBackend {
     return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
 }
 
+<#
+.SYNOPSIS
+Starts the harness-owned local model backend.
+.DESCRIPTION
+Starts the OpenAI-compatible local provider for fallback, Transformers, or llama.cpp-backed local models.
+#>
 function Start-HarnessModelBackend {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "Medium")]
     param(
         [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
         [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
         [string]$Model = $Script:HarnessModelBackendDefaultModel,
-        [ValidateSet("auto", "fallback", "transformers")]
+        [ValidateSet("auto", "fallback", "transformers", "llamacpp", "llama_cpp", "llama-cpp")]
         [string]$Backend = "auto",
         [string]$ModelPath = "",
         [string]$ModelsRoot = "",
         [string[]]$ExtraModel,
         [string]$Device = "cpu",
         [int]$MaxNewTokens = 256,
+        [int]$LlamaCppContext = 4096,
+        [int]$LlamaCppGpuLayers = 0,
+        [int]$LlamaCppThreads = 4,
         [switch]$LocalOnly,
+        [switch]$AllowFallback,
         [int]$WaitSeconds = 30,
+        [string]$PythonPath = "",
         [switch]$DryRun,
         [Alias("Properties")]
         [string[]]$Property,
@@ -1357,9 +2142,95 @@ function Start-HarnessModelBackend {
     if ([string]::IsNullOrWhiteSpace($Model)) {
         $Model = $Script:HarnessModelBackendDefaultModel
     }
+    if ($Backend -in @("llama_cpp", "llama-cpp")) {
+        $Backend = "llamacpp"
+    }
+    $modelHasInlineSource = [bool]($Model -match "(::|=)")
+    $modelPathProvided = -not [string]::IsNullOrWhiteSpace($ModelPath)
+    $modelsRootProvided = -not [string]::IsNullOrWhiteSpace($ModelsRoot)
+    $tagLikeModelId = [bool]($Model -match "^[^\\/:=]+:[^\\/:=]+$")
+    $huggingFaceCacheModelId = [bool]($Model -match "(?i)^hf://")
+    $sourceResolution = _Resolve-HarnessModelBackendSource -Model $Model -ModelPath $ModelPath -ModelsRoot $ModelsRoot
+    $sourceResolved = [bool]$sourceResolution.resolved
+    $extraModelSourceMatched = $false
+    $primaryModelHasSource = $modelPathProvided -or $modelsRootProvided -or $modelHasInlineSource
+    if (-not $primaryModelHasSource -and $ExtraModel -and $ExtraModel.Count -gt 0) {
+        foreach ($extra in $ExtraModel) {
+            if ([string]::IsNullOrWhiteSpace($extra)) { continue }
+            if ($extra -match "^\s*(?<id>[^:=]+)\s*(::|=)\s*(?<source>.+)$") {
+                if ($matches["id"].Trim() -eq $Model -and -not [string]::IsNullOrWhiteSpace($matches["source"])) {
+                    $extraModelSourceMatched = $true
+                    $primaryModelHasSource = $true
+                    break
+                }
+            }
+        }
+    }
+    $fallbackAllowed = [bool]($AllowFallback.IsPresent -or $Backend -eq "fallback")
+    $primaryModelCanResolveLocally = [bool]($sourceResolved -or $extraModelSourceMatched -or $modelHasInlineSource)
+    $extraModelCount = if ($ExtraModel) { $ExtraModel.Count } else { 0 }
+    Write-Verbose ("Start-HarnessModelBackend resolving startup: model='{0}', backend='{1}', host='{2}', port={3}, modelPathSet={4}, modelsRootSet={5}, extraModelCount={6}, allowFallback={7}, localOnly={8}" -f $Model, $Backend, $ModelBackendHost, $ModelBackendPort, $modelPathProvided, $modelsRootProvided, $extraModelCount, $fallbackAllowed, [bool]$LocalOnly.IsPresent)
+    Write-Debug ("Model source detection: inlineSource={0}; modelPathSet={1}; modelsRootSet={2}; extraModelSourceMatched={3}; primaryModelHasSource={4}; primaryModelCanResolveLocally={5}; sourceResolved={6}; sourceType={7}; fallbackAllowed={8}; tagLikeModelId={9}; huggingFaceCacheModelId={10}" -f $modelHasInlineSource, $modelPathProvided, $modelsRootProvided, $extraModelSourceMatched, $primaryModelHasSource, $primaryModelCanResolveLocally, $sourceResolved, $sourceResolution.source_type, $fallbackAllowed, $tagLikeModelId, $huggingFaceCacheModelId)
+    if ($modelPathProvided -and -not $sourceResolved -and -not $fallbackAllowed) {
+        throw "Start-HarnessModelBackend: -ModelPath does not exist or could not be resolved: $($sourceResolution.source)"
+    }
+    if ($Backend -eq "auto" -and -not $fallbackAllowed -and -not $primaryModelCanResolveLocally) {
+        Write-Verbose "Start-HarnessModelBackend blocked startup before launching python because -Backend auto has no local model source and fallback is not explicit."
+        Write-Debug "No process was started. Provide -ModelPath/-ModelsRoot for a real local model artifact, or choose -Backend fallback/-AllowFallback for deterministic diagnostic stub mode."
+        if ($tagLikeModelId) {
+            Write-Debug ("Model '{0}' looks like a name:tag model identifier and can be resolved from a local model store when its manifest/blob files are present." -f $Model)
+        }
+        $guardMessage = @(
+            "Start-HarnessModelBackend: -Backend auto requires a real local model source before it can launch."
+            "Model='$Model'; Backend='$Backend'; ModelPath='<empty>'; ModelsRoot='<empty>'; ExtraModelCount=$extraModelCount; AllowFallback=$fallbackAllowed."
+            "Use -ModelPath '<local Hugging Face model folder or GGUF file>', -ModelsRoot '<local model root>', an hf:// model id already present in the local Hugging Face cache, or a tag already present in a local Ollama-style model store."
+            "Use -Backend fallback or -AllowFallback only when you intentionally want deterministic diagnostic stub mode."
+        )
+        throw ($guardMessage -join " ")
+    }
+    $expectedGenerationBackend = if ($Backend -eq "fallback") {
+        "fallback"
+    } elseif ($Backend -eq "transformers") {
+        "transformers"
+    } elseif ($Backend -eq "llamacpp") {
+        "llamacpp"
+    } elseif ($sourceResolved -and -not [string]::IsNullOrWhiteSpace($sourceResolution.generation_backend)) {
+        [string]$sourceResolution.generation_backend
+    } elseif ($fallbackAllowed) {
+        "fallback"
+    } else {
+        "transformers"
+    }
+    $expectedModelSource = if ($sourceResolved) { $sourceResolution.source } else { $null }
+    $expectedModelSourceType = if ($sourceResolved) { $sourceResolution.source_type } else { $null }
+    $expectedArtifactFormat = if ($sourceResolved) { $sourceResolution.artifact_format } else { $null }
+    $expectedProviderStore = if ($sourceResolved) { $sourceResolution.provider_store } else { $null }
+    $expectedManifestPath = if ($sourceResolved) { $sourceResolution.manifest_path } else { $null }
+    $expectedLocalModelLoaded = [bool](
+        $expectedGenerationBackend -in @("transformers", "llamacpp") -and
+        -not [string]::IsNullOrWhiteSpace($expectedModelSource) -and
+        (
+            $expectedModelSourceType -ne "huggingface_cache" -or
+            (_Test-HarnessHuggingFaceCacheHasWeights -CacheDir ([string]$sourceResolution.manifest_path))
+        )
+    )
+    $providerWarning = if ($expectedGenerationBackend -eq "fallback") {
+        "Deterministic fallback provider is active. This is diagnostic stub mode, not a real LLM."
+    } else {
+        $null
+    }
+    $expectedModelSourcePresent = [bool](
+        -not [string]::IsNullOrWhiteSpace($expectedModelSource) -and
+        (
+            $expectedModelSourceType -eq "huggingface_cache" -or
+            (Test-Path -LiteralPath ([string]$expectedModelSource) -ErrorAction SilentlyContinue)
+        )
+    )
+    $expectedTemplateApplied = [bool]($expectedGenerationBackend -eq "llamacpp" -and $expectedProviderStore -eq "ollama")
 
     $healthUrl = _HealthUrl -TargetHost $ModelBackendHost -Port $ModelBackendPort
     $entryKey = "model-backend|$ModelBackendHost|$ModelBackendPort"
+    $resolvedPythonPath = _Resolve-HarnessPythonPath -PythonPath $PythonPath
     $startArgs = @(
         "-m",
         "harness.local_model_provider",
@@ -1374,7 +2245,13 @@ function Start-HarnessModelBackend {
         "--device",
         $Device,
         "--max-new-tokens",
-        $MaxNewTokens.ToString()
+        $MaxNewTokens.ToString(),
+        "--llama-cpp-n-ctx",
+        $LlamaCppContext.ToString(),
+        "--llama-cpp-n-gpu-layers",
+        $LlamaCppGpuLayers.ToString(),
+        "--llama-cpp-n-threads",
+        $LlamaCppThreads.ToString()
     )
     if (-not [string]::IsNullOrWhiteSpace($ModelPath)) {
         $startArgs += @("--model-path", $ModelPath)
@@ -1391,21 +2268,44 @@ function Start-HarnessModelBackend {
     if ($LocalOnly.IsPresent) {
         $startArgs += "--local-only"
     }
-    $command = "python $($startArgs -join ' ')"
+    if ($AllowFallback.IsPresent) {
+        $startArgs += "--allow-fallback"
+    }
+    $command = _Format-HarnessCommand -Executable $resolvedPythonPath -Arguments $startArgs
 
     $existingSessions = _Prune-StaleModelSessions -Sessions (_Read-HarnessModelBackendSessions)
     $runningSession = _Find-LiveModelBackendSession -Sessions $existingSessions -ModelBackendHost $ModelBackendHost -ModelBackendPort $ModelBackendPort
     if ($null -ne $runningSession) {
-        $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "action", "started", "host", "port", "model", "process_id", "health_url") -Property @{
+        $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "action", "started", "host", "port", "model", "generation_backend", "fallback_active", "provider_warning", "process_id", "health_url") -Property @{
             mode = "model_backend"
             started = $false
             action = "already_running"
             host = $ModelBackendHost
             port = $ModelBackendPort
             model = $Model
+            configured_backend = $Backend
+            generation_backend = $expectedGenerationBackend
+            model_source = $expectedModelSource
+            model_source_type = $expectedModelSourceType
+            model_artifact_format = $expectedArtifactFormat
+            provider_store = $expectedProviderStore
+            manifest_path = $expectedManifestPath
+            local_model_loaded = $expectedLocalModelLoaded
+            model_source_present = $expectedModelSourcePresent
+            model_load_attempted = $false
+            model_load_succeeded = $false
+            last_load_error = $null
+            last_generation_error = $null
+            template_applied = $expectedTemplateApplied
+            fallback_active = [bool]($expectedGenerationBackend -eq "fallback")
+            allow_fallback = $fallbackAllowed
+            provider_warning = $providerWarning
+            python_path = if ($runningSession.PSObject.Properties.Name -contains "python_path") { $runningSession.python_path } else { $resolvedPythonPath }
             command = $command
             health_url = $healthUrl
             process_id = [int]$runningSession.process_id
+            stdout_log = if ($runningSession.PSObject.Properties.Name -contains "stdout_log") { $runningSession.stdout_log } else { $null }
+            stderr_log = if ($runningSession.PSObject.Properties.Name -contains "stderr_log") { $runningSession.stderr_log } else { $null }
             session_file = $Script:HarnessModelBackendSessionFile
         }
         return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
@@ -1424,12 +2324,30 @@ function Start-HarnessModelBackend {
     }
 
     if ($DryRun) {
-        $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "started", "host", "port", "model", "health_url") -Property @{
+        $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "started", "host", "port", "model", "generation_backend", "fallback_active", "provider_warning", "health_url") -Property @{
             mode = "model_backend"
             started = $false
             host = $ModelBackendHost
             port = $ModelBackendPort
             model = $Model
+            configured_backend = $Backend
+            generation_backend = $expectedGenerationBackend
+            model_source = $expectedModelSource
+            model_source_type = $expectedModelSourceType
+            model_artifact_format = $expectedArtifactFormat
+            provider_store = $expectedProviderStore
+            manifest_path = $expectedManifestPath
+            local_model_loaded = $expectedLocalModelLoaded
+            model_source_present = $expectedModelSourcePresent
+            model_load_attempted = $false
+            model_load_succeeded = $false
+            last_load_error = $null
+            last_generation_error = $null
+            template_applied = $expectedTemplateApplied
+            fallback_active = [bool]($expectedGenerationBackend -eq "fallback")
+            allow_fallback = $fallbackAllowed
+            provider_warning = $providerWarning
+            python_path = $resolvedPythonPath
             command = $command
             health_url = $healthUrl
             session_file = $Script:HarnessModelBackendSessionFile
@@ -1437,38 +2355,55 @@ function Start-HarnessModelBackend {
         return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
-    $stdoutPath = [System.IO.Path]::GetTempFileName()
-    $stderrPath = [System.IO.Path]::GetTempFileName()
+    $logPaths = _New-HarnessLogPaths -Prefix "model-$ModelBackendPort"
+    $stdoutPath = [string]$logPaths.stdout_log
+    $stderrPath = [string]$logPaths.stderr_log
+    if (-not $PSCmdlet.ShouldProcess("$ModelBackendHost`:$ModelBackendPort", "Start harness local model backend")) {
+        $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "action", "started", "host", "port", "model", "generation_backend", "fallback_active", "provider_warning", "health_url") -Property @{
+            mode = "model_backend"
+            started = $false
+            action = "whatif"
+            host = $ModelBackendHost
+            port = $ModelBackendPort
+            model = $Model
+            configured_backend = $Backend
+            generation_backend = $expectedGenerationBackend
+            model_source = $expectedModelSource
+            model_source_type = $expectedModelSourceType
+            model_artifact_format = $expectedArtifactFormat
+            provider_store = $expectedProviderStore
+            manifest_path = $expectedManifestPath
+            local_model_loaded = $expectedLocalModelLoaded
+            model_source_present = $expectedModelSourcePresent
+            model_load_attempted = $false
+            model_load_succeeded = $false
+            last_load_error = $null
+            last_generation_error = $null
+            template_applied = $expectedTemplateApplied
+            fallback_active = [bool]($expectedGenerationBackend -eq "fallback")
+            allow_fallback = $fallbackAllowed
+            provider_warning = $providerWarning
+            python_path = $resolvedPythonPath
+            command = $command
+            health_url = $healthUrl
+            stdout_log = $stdoutPath
+            stderr_log = $stderrPath
+            session_file = $Script:HarnessModelBackendSessionFile
+        }
+        return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
+    }
     try {
-        $process = Start-Process -FilePath "python" -ArgumentList $startArgs -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        $process = Start-Process -FilePath $resolvedPythonPath -ArgumentList $startArgs -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
     } catch {
-        if (Test-Path $stdoutPath) {
-            Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path $stderrPath) {
-            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
-        }
         throw "Failed to start local model backend process."
     }
     if ($null -eq $process) {
-        if (Test-Path $stdoutPath) {
-            Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path $stderrPath) {
-            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
-        }
         throw "Failed to start local model backend process."
     }
     if ($process.HasExited) {
         $startupError = ""
         if (Test-Path $stderrPath) {
             $startupError = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
-        }
-        if (Test-Path $stdoutPath) {
-            Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path $stderrPath) {
-            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
         }
         throw "Local model backend exited immediately with code $($process.ExitCode). $startupError"
     }
@@ -1478,20 +2413,8 @@ function Start-HarnessModelBackend {
         if (Test-Path $stderrPath) {
             $startupError = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
         }
-        if (Test-Path $stdoutPath) {
-            Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path $stderrPath) {
-            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
-        }
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         throw "Local model backend at $($healthUrl) did not become ready after ${WaitSeconds}s. $startupError"
-    }
-    if (Test-Path $stdoutPath) {
-        Remove-Item $stdoutPath -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path $stderrPath) {
-        Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
     }
 
     $entry = @{
@@ -1501,8 +2424,28 @@ function Start-HarnessModelBackend {
         host = $ModelBackendHost
         port = $ModelBackendPort
         model = $Model
+        configured_backend = $Backend
+        generation_backend = $expectedGenerationBackend
+        model_source = $expectedModelSource
+        model_source_type = $expectedModelSourceType
+        model_artifact_format = $expectedArtifactFormat
+        provider_store = $expectedProviderStore
+        manifest_path = $expectedManifestPath
+        local_model_loaded = $expectedLocalModelLoaded
+        model_source_present = $expectedModelSourcePresent
+        model_load_attempted = $false
+        model_load_succeeded = $false
+        last_load_error = $null
+        last_generation_error = $null
+        template_applied = $expectedTemplateApplied
+        fallback_active = [bool]($expectedGenerationBackend -eq "fallback")
+        allow_fallback = $fallbackAllowed
+        provider_warning = $providerWarning
+        python_path = $resolvedPythonPath
         command = $command
         health_url = $healthUrl
+        stdout_log = $stdoutPath
+        stderr_log = $stderrPath
         started_utc = (Get-Date).ToUniversalTime().ToString("o")
     }
 
@@ -1510,22 +2453,48 @@ function Start-HarnessModelBackend {
     $sessions += $entry
     _Write-HarnessModelBackendSessions -Sessions $sessions
 
-    $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "started", "host", "port", "model", "process_id", "health_url") -Property @{
+    $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StartResult" -DefaultDisplayPropertySet @("mode", "started", "host", "port", "model", "generation_backend", "fallback_active", "provider_warning", "process_id", "health_url") -Property @{
         mode = "model_backend"
         started = $true
         host = $ModelBackendHost
         port = $ModelBackendPort
         model = $Model
+        configured_backend = $Backend
+        generation_backend = $expectedGenerationBackend
+        model_source = $expectedModelSource
+        model_source_type = $expectedModelSourceType
+        model_artifact_format = $expectedArtifactFormat
+        provider_store = $expectedProviderStore
+        manifest_path = $expectedManifestPath
+        local_model_loaded = $expectedLocalModelLoaded
+        model_source_present = $expectedModelSourcePresent
+        model_load_attempted = $false
+        model_load_succeeded = $false
+        last_load_error = $null
+        last_generation_error = $null
+        template_applied = $expectedTemplateApplied
+        fallback_active = [bool]($expectedGenerationBackend -eq "fallback")
+        allow_fallback = $fallbackAllowed
+        provider_warning = $providerWarning
+        python_path = $resolvedPythonPath
         command = $command
         health_url = $healthUrl
         process_id = $process.Id
+        stdout_log = $stdoutPath
+        stderr_log = $stderrPath
         session_file = $Script:HarnessModelBackendSessionFile
     }
     return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
 }
 
+<#
+.SYNOPSIS
+Starts the harness-owned local LLM backend.
+.DESCRIPTION
+Convenience wrapper around Start-HarnessModelBackend for local model development and diagnostics.
+#>
 function Start-HarnessOwnLLMBackend {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "Medium")]
     param(
         [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
         [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
@@ -1536,8 +2505,13 @@ function Start-HarnessOwnLLMBackend {
         [string]$Backend = "auto",
         [string]$Device = "cpu",
         [int]$MaxNewTokens = 256,
+        [int]$LlamaCppContext = 4096,
+        [int]$LlamaCppGpuLayers = 0,
+        [int]$LlamaCppThreads = 4,
         [switch]$LocalOnly,
+        [switch]$AllowFallback,
         [int]$WaitSeconds = 30,
+        [string]$PythonPath = "",
         [switch]$DryRun,
         [Alias("Properties")]
         [string[]]$Property,
@@ -1556,8 +2530,13 @@ function Start-HarnessOwnLLMBackend {
         -ExtraModel $ExtraModel `
         -Device $Device `
         -MaxNewTokens $MaxNewTokens `
+        -LlamaCppContext $LlamaCppContext `
+        -LlamaCppGpuLayers $LlamaCppGpuLayers `
+        -LlamaCppThreads $LlamaCppThreads `
         -LocalOnly:$LocalOnly.IsPresent `
+        -AllowFallback:$AllowFallback.IsPresent `
         -WaitSeconds $WaitSeconds `
+        -PythonPath $PythonPath `
         -DryRun:$DryRun.IsPresent `
         -Property $Property `
         -ExpandProperty $ExpandProperty `
@@ -1571,8 +2550,14 @@ Set-Alias -Name Stop-HarnessLocalLLMBackend -Value Stop-HarnessModelBackend
 Set-Alias -Name Get-HarnessOwnLLMBackendStatus -Value Get-HarnessModelBackendStatus
 Set-Alias -Name Get-HarnessLocalLLMBackendStatus -Value Get-HarnessModelBackendStatus
 
+<#
+.SYNOPSIS
+Stops tracked harness local model backends.
+.DESCRIPTION
+Stops the harness-owned model provider process by host/port or every tracked provider with -All.
+#>
 function Stop-HarnessModelBackend {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "Medium")]
     param(
         [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
         [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
@@ -1590,6 +2575,7 @@ function Stop-HarnessModelBackend {
     $sessions = _Prune-StaleModelSessions -Sessions $rawSessions
     $remaining = @()
     $removed = @()
+    $shouldStop = $DryRun.IsPresent -or $PSCmdlet.ShouldProcess("$ModelBackendHost`:$ModelBackendPort", "Stop harness local model backend")
 
     foreach ($entry in $sessions) {
         if ($entry.mode -ne "model_backend") {
@@ -1604,7 +2590,10 @@ function Stop-HarnessModelBackend {
         }
 
         $removed += $entry
-        if ($DryRun) {
+        if ($DryRun -or -not $shouldStop) {
+            if (-not $DryRun) {
+                $remaining += $entry
+            }
             continue
         }
         if ($entry.process_id -and (Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue)) {
@@ -1612,10 +2601,10 @@ function Stop-HarnessModelBackend {
         }
     }
 
-    if ($DryRun) {
+    if ($DryRun -or -not $shouldStop) {
         $result = _New-HarnessObject -TypeName "Harness.ModelBackend.StopResult" -DefaultDisplayPropertySet @("mode", "action", "removed_count") -Property @{
             mode = "model_backend"
-            action = "stopped"
+            action = if ($DryRun) { "stopped" } else { "whatif" }
             removed_count = $removed.Count
             removed = $removed
         }
@@ -1635,6 +2624,12 @@ function Stop-HarnessModelBackend {
     return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
 }
 
+<#
+.SYNOPSIS
+Gets harness local model backend status.
+.DESCRIPTION
+Reads /health and /v1/models from the local provider and returns flattened diagnostics plus nested payloads.
+#>
 function Get-HarnessModelBackendStatus {
     [CmdletBinding()]
     param(
@@ -1681,6 +2676,8 @@ function Get-HarnessModelBackendStatus {
         error = $null
         models = @()
         model_present = $false
+        payload = $null
+        model_entry = $null
     }
     try {
         $catalogResponse = Invoke-WebRequest -Uri $modelsUrl -Method Get -TimeoutSec $RequestTimeoutSeconds -ErrorAction Stop
@@ -1688,11 +2685,13 @@ function Get-HarnessModelBackendStatus {
         $models.reachable = $catalogResponse.StatusCode -ge 200 -and $catalogResponse.StatusCode -lt 300
         if ($models.reachable) {
             $catalogPayload = _Build-StatusPayload -Body $catalogResponse.Content
+            $models.payload = $catalogPayload
             $catalogModels = @(_Normalize-ModelsPayload -CatalogPayload $catalogPayload)
             if ($null -ne $catalogModels) {
                 $models.models = $catalogModels
             }
             $models.model_present = $catalogModels.Count -gt 0
+            $models.model_entry = _Get-ModelCatalogEntry -CatalogPayload $catalogPayload
         } else {
             $models.error = "Model catalog request returned status $($catalogResponse.StatusCode)"
         }
@@ -1707,11 +2706,55 @@ function Get-HarnessModelBackendStatus {
     if ($models.models -and $models.models.Count -gt 0) {
         $selectedModel = [string]$models.models[0]
     }
+    if ($null -ne $models.payload) {
+        $models.model_entry = _Get-ModelCatalogEntry -CatalogPayload $models.payload -ModelName $selectedModel
+    }
+    $diagnostics = _Get-ProviderDiagnosticsFromPayloads -HealthPayload $health.payload -ModelEntry $models.model_entry
+    $sessionEntriesForStatus = @(
+        foreach ($entry in (_Prune-StaleModelSessions -Sessions (_Read-HarnessModelBackendSessions))) {
+            if ($entry.mode -eq "model_backend" -and $entry.host -eq $ModelBackendHost -and [int]$entry.port -eq $ModelBackendPort) {
+                if ($entry.process_id) {
+                    $entry | Add-Member -NotePropertyName running -NotePropertyValue (
+                        [bool](Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue)
+                    ) -Force
+                }
+                $entry
+            }
+        }
+    )
+    $primarySession = $null
+    if ($sessionEntriesForStatus.Count -gt 0) {
+        $primarySession = $sessionEntriesForStatus[0]
+    }
     $result = [PSCustomObject]@{
         timestamp = (Get-Date).ToUniversalTime().ToString("o")
         host = $ModelBackendHost
         port = $ModelBackendPort
         model = $selectedModel
+        configured_backend = $diagnostics.configured_backend
+        generation_backend = $diagnostics.generation_backend
+        model_source = $diagnostics.model_source
+        model_source_type = $diagnostics.model_source_type
+        model_artifact_format = $diagnostics.model_artifact_format
+        provider_store = $diagnostics.provider_store
+        manifest_path = $diagnostics.manifest_path
+        runtime_dependency = $diagnostics.runtime_dependency
+        runtime_dependency_available = [bool]$diagnostics.runtime_dependency_available
+        local_model_loaded = [bool]$diagnostics.local_model_loaded
+        model_source_present = [bool]$diagnostics.model_source_present
+        model_load_attempted = [bool]$diagnostics.model_load_attempted
+        model_load_succeeded = [bool]$diagnostics.model_load_succeeded
+        last_load_error = $diagnostics.last_load_error
+        last_generation_error = $diagnostics.last_generation_error
+        template_applied = [bool]$diagnostics.template_applied
+        finish_reason = $diagnostics.finish_reason
+        truncated = [bool]$diagnostics.truncated
+        reasoning_extracted = [bool]$diagnostics.reasoning_extracted
+        fallback_active = [bool]$diagnostics.fallback_active
+        provider_warning = $diagnostics.provider_warning
+        python_path = if ($null -ne $primarySession -and $primarySession.PSObject.Properties.Name -contains "python_path") { $primarySession.python_path } else { $null }
+        stdout_log = if ($null -ne $primarySession -and $primarySession.PSObject.Properties.Name -contains "stdout_log") { $primarySession.stdout_log } else { $null }
+        stderr_log = if ($null -ne $primarySession -and $primarySession.PSObject.Properties.Name -contains "stderr_log") { $primarySession.stderr_log } else { $null }
         health_reachable = [bool]$health.reachable
         health_status_code = $health.status_code
         health_error = $health.error
@@ -1724,19 +2767,7 @@ function Get-HarnessModelBackendStatus {
     }
 
     if ($IncludeSession) {
-        $sessionEntries = @(
-            foreach ($entry in (_Prune-StaleModelSessions -Sessions (_Read-HarnessModelBackendSessions))) {
-                if ($entry.mode -eq "model_backend" -and $entry.host -eq $ModelBackendHost -and [int]$entry.port -eq $ModelBackendPort) {
-                    if ($entry.process_id) {
-                        $entry | Add-Member -NotePropertyName running -NotePropertyValue (
-                            [bool](Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue)
-                        ) -Force
-                    }
-                    $entry
-                }
-            }
-        )
-        $result | Add-Member -NotePropertyName session -NotePropertyValue $sessionEntries
+        $result | Add-Member -NotePropertyName session -NotePropertyValue $sessionEntriesForStatus
     }
 
     $result = _Add-HarnessTypeName `
@@ -1746,11 +2777,23 @@ function Get-HarnessModelBackendStatus {
             "host",
             "port",
             "model",
+            "generation_backend",
+            "model_source_type",
+            "model_artifact_format",
+            "provider_store",
+            "runtime_dependency_available",
+            "model_source_present",
+            "model_load_attempted",
+            "model_load_succeeded",
+            "template_applied",
+            "truncated",
+            "fallback_active",
             "health_reachable",
             "models_reachable",
             "model_catalog_present",
             "health_error",
-            "models_error"
+            "models_error",
+            "provider_warning"
         )
     return _Apply-HarnessOutputOptions `
         -InputObject $result `
@@ -1760,6 +2803,132 @@ function Get-HarnessModelBackendStatus {
         -JsonDepth $JsonDepth
 }
 
+<#
+.SYNOPSIS
+Stops the tracked runtime and model backend stack.
+.DESCRIPTION
+Coordinates Stop-HarnessBackend and Stop-HarnessModelBackend while preserving object-first output.
+#>
+function Stop-HarnessStack {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "Medium")]
+    param(
+        [ValidateSet("local", "containerized")]
+        [string]$ExecutionMode = "local",
+        [string]$Config = "harness.yaml",
+        [string]$ServerHost = "127.0.0.1",
+        [int]$Port = 8080,
+        [string]$ContainerProfile = "",
+        [string]$ComposeFile = "docker-compose.nvidia.yaml",
+        [string]$EnvFile = "",
+        [string]$ModelBackendHost = $Script:HarnessModelBackendDefaultHost,
+        [int]$ModelBackendPort = $Script:HarnessModelBackendDefaultPort,
+        [switch]$All,
+        [switch]$SkipRuntimeBackend,
+        [switch]$SkipModelBackend,
+        [switch]$DryRun,
+        [Alias("Properties")]
+        [string[]]$Property,
+        [string]$ExpandProperty = "",
+        [switch]$AsJson,
+        [int]$JsonDepth = 20
+    )
+
+    if ($SkipRuntimeBackend -and $SkipModelBackend) {
+        throw "At least one backend must be selected. Remove -SkipRuntimeBackend or -SkipModelBackend."
+    }
+
+    $runtimeResult = $null
+    $modelResult = $null
+    $errors = @()
+
+    if (-not $SkipRuntimeBackend) {
+        try {
+            $runtimeResult = Stop-HarnessBackend `
+                -ExecutionMode $ExecutionMode `
+                -Config $Config `
+                -ServerHost $ServerHost `
+                -Port $Port `
+                -ContainerProfile $ContainerProfile `
+                -ComposeFile $ComposeFile `
+                -EnvFile $EnvFile `
+                -All:$All.IsPresent `
+                -DryRun:$DryRun.IsPresent
+        } catch {
+            $errors += [PSCustomObject]@{
+                target = "runtime_backend"
+                message = $_.Exception.Message
+            }
+        }
+    }
+
+    if (-not $SkipModelBackend) {
+        try {
+            $modelResult = Stop-HarnessModelBackend `
+                -ModelBackendHost $ModelBackendHost `
+                -ModelBackendPort $ModelBackendPort `
+                -All:$All.IsPresent `
+                -DryRun:$DryRun.IsPresent
+        } catch {
+            $errors += [PSCustomObject]@{
+                target = "model_backend"
+                message = $_.Exception.Message
+            }
+        }
+    }
+
+    $runtimeRemoved = if ($null -ne $runtimeResult -and $runtimeResult.PSObject.Properties.Name -contains "removed_count") {
+        [int]$runtimeResult.removed_count
+    } else {
+        0
+    }
+    $modelRemoved = if ($null -ne $modelResult -and $modelResult.PSObject.Properties.Name -contains "removed_count") {
+        [int]$modelResult.removed_count
+    } else {
+        0
+    }
+
+    $result = _New-HarnessObject `
+        -TypeName "Harness.Stack.StopResult" `
+        -DefaultDisplayPropertySet @(
+            "action",
+            "ok",
+            "dry_run",
+            "runtime_removed_count",
+            "model_removed_count",
+            "error_count"
+        ) `
+        -Property ([ordered]@{
+            action = "stopped"
+            ok = ($errors.Count -eq 0)
+            dry_run = [bool]$DryRun.IsPresent
+            all = [bool]$All.IsPresent
+            runtime_backend_skipped = [bool]$SkipRuntimeBackend.IsPresent
+            model_backend_skipped = [bool]$SkipModelBackend.IsPresent
+            runtime_removed_count = $runtimeRemoved
+            model_removed_count = $modelRemoved
+            error_count = $errors.Count
+            runtime_backend = $runtimeResult
+            model_backend = $modelResult
+            errors = $errors
+        })
+
+    return _Apply-HarnessOutputOptions `
+        -InputObject $result `
+        -Property $Property `
+        -ExpandProperty $ExpandProperty `
+        -AsJson:$AsJson.IsPresent `
+        -JsonDepth $JsonDepth
+}
+
+Set-Alias -Name Stop-HarnessAll -Value Stop-HarnessStack
+Set-Alias -Name Stop-HarnessEverything -Value Stop-HarnessStack
+
+<#
+.SYNOPSIS
+Sends one prompt through the harness runtime or demo path.
+.DESCRIPTION
+Builds the runtime request, optionally starts a temporary server, and returns the OpenAI-compatible response with convenience fields.
+#>
 function Invoke-HarnessOneShot {
     [CmdletBinding()]
     param(
@@ -1781,6 +2950,7 @@ function Invoke-HarnessOneShot {
         [string]$FeatureLevel = "",
         [ValidateSet("off", "docker")]
         [string]$ToolSandbox = "",
+        [string]$PythonPath = "",
         [switch]$RequireEvidence,
         [switch]$EnableAdvancedRouter,
         [switch]$NoNetwork,
@@ -1796,6 +2966,7 @@ function Invoke-HarnessOneShot {
     )
 
     $ErrorActionPreference = "Stop"
+    $resolvedPythonPath = _Resolve-HarnessPythonPath -PythonPath $PythonPath
 
     function _Invoke-PythonOneshotHelper {
         param(
@@ -1894,7 +3065,7 @@ except Exception as exc:
     raise SystemExit(1)
 '@
 
-        $helperOutput = & python -c $pythonScript 2>&1
+        $helperOutput = & $resolvedPythonPath -c $pythonScript 2>&1
         $helperOutputText = $helperOutput | Out-String
         if ($LASTEXITCODE -ne 0) {
             $normalized = $helperOutputText.Trim()
@@ -1906,7 +3077,10 @@ except Exception as exc:
                 $backendError = @"
 Invoke-HarnessOneShot: runtime backend preflight failed with code $backendCode at the configured /v1/models endpoint.
 Model backend check failed and runtime may not be reachable.
-Start your local model backend with `Start-HarnessOwnLLMBackend -Model "<model>"`,
+Start a real local model with `Start-HarnessOwnLLMBackend -Model "<model>" -Backend auto -ModelPath "<local Hugging Face folder or GGUF file>" -LocalOnly`,
+or `Start-HarnessOwnLLMBackend -Model "qwen3:4b" -Backend auto -ModelsRoot "`$env:USERPROFILE\.ollama\models" -LocalOnly`,
+or `Start-HarnessOwnLLMBackend -Model "hf://vendor/model" -Backend auto -LocalOnly` when the model is already in the local Hugging Face cache,
+or explicitly start diagnostic stub mode with `Start-HarnessOwnLLMBackend -Model "<model>" -Backend fallback`,
 or rerun with -Mode demo or -SkipBackendCheck (intended only for controlled diagnostics).
 error_code=$backendCode. $normalized
 "@
@@ -2040,6 +3214,7 @@ error_code=$backendCode. $normalized
                 backend_url = $helper.backend_url
                 config_path = $helper.config_path
                 mode = "runtime"
+                python_path = $resolvedPythonPath
                 runtime_env = $runtimeEnv
             }
             if ($AnswerOnly) {
@@ -2067,7 +3242,7 @@ error_code=$backendCode. $normalized
                     $envSnapshot = _Apply-ServerEnvironment -Environment $runtimeEnv
                 }
 
-                $serverProcess = Start-Process -FilePath "python" -ArgumentList @(
+                $serverProcess = Start-Process -FilePath $resolvedPythonPath -ArgumentList @(
                     "-m",
                     "harness.server",
                     "--config",

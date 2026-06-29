@@ -60,8 +60,16 @@ class ResponseCache:
         with file.open("w", encoding="utf-8") as f:
             json.dump(value, f, indent=2)
 
-        # opportunistic cleanup: keep newest files only.
-        entries = sorted(self.path.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in entries[self.max_entries :]:
+        # Opportunistic cleanup: keep newest files only. On Windows, antivirus,
+        # parallel test processes, or another harness run can remove a file
+        # between glob() and stat(); ignore those transient entries.
+        entries: list[tuple[Path, float]] = []
+        for candidate in self.path.glob("*.json"):
+            try:
+                entries.append((candidate, candidate.stat().st_mtime))
+            except FileNotFoundError:
+                continue
+        entries = sorted(entries, key=lambda item: item[1], reverse=True)
+        for old, _mtime in entries[self.max_entries :]:
             old.unlink(missing_ok=True)
         return key

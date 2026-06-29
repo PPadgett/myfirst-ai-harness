@@ -26,14 +26,19 @@ def test_real_engine_unknown_tool_returns_unknown_tool_error() -> None:
 
 def test_real_engine_tool_budget_guard_emits_branch_metadata() -> None:
     engine = _make_engine()
-    result = engine.phase_execute_tools(
-        route_id="run_tests",
-        plan=[
-            {"name": "run_tests", "arguments": {}},
-            {"name": "new_uuid", "arguments": {}},
-            {"name": "calculator", "arguments": {"expression": "1 + 1"}},
-        ],
-    )
+    with mock.patch.object(
+        engine,
+        "_tool_run_tests",
+        return_value={"tool": "run_tests", "success": True, "output": {"returncode": 0}},
+    ):
+        result = engine.phase_execute_tools(
+            route_id="run_tests",
+            plan=[
+                {"name": "run_tests", "arguments": {}},
+                {"name": "new_uuid", "arguments": {}},
+                {"name": "calculator", "arguments": {"expression": "1 + 1"}},
+            ],
+        )
     outputs = result["tool_outputs"]
     assert outputs
     assert any(output.get("tool") == "tool_budget_guard" for output in outputs)

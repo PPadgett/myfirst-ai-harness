@@ -37,6 +37,34 @@ from harness.retrieval import DirectoryCorpusRetriever, RetrievedDoc, SimpleRera
 
 MODEL_BACKEND_UNAVAILABLE_CODE = "model_backend_unavailable"
 MODEL_REQUEST_FAILED_CODE = "model_request_failed"
+PROVIDER_DIAGNOSTIC_KEYS = (
+    "model",
+    "configured_backend",
+    "generation_backend",
+    "model_source",
+    "model_source_type",
+    "model_artifact_format",
+    "provider_store",
+    "manifest_path",
+    "runtime_dependency",
+    "runtime_dependency_available",
+    "local_model_loaded",
+    "model_source_present",
+    "model_load_attempted",
+    "model_load_succeeded",
+    "last_load_error",
+    "last_generation_error",
+    "template_applied",
+    "fallback_active",
+    "allow_fallback",
+    "finish_reason",
+    "truncated",
+    "reasoning_extracted",
+    "warnings",
+    "provider_warning",
+)
+
+RESPONSE_NORMALIZATION_VERSION = "2026-06-29-qwen3-clean-answer-v1"
 
 
 @dataclass
@@ -328,6 +356,7 @@ class HarnessRuntime:
 
         # Cache key excludes volatile outputs.
         cache_key_payload = {
+            "response_normalization_version": RESPONSE_NORMALIZATION_VERSION,
             "model": model,
             "messages": messages,
             "policy": route.as_dict(),
@@ -426,7 +455,11 @@ class HarnessRuntime:
                     tool_calls=[],
                 )
 
-            stage_events.append({"stage": "tool_plan", "model_usage": tool_plan_res.usage})
+            tool_plan_stage = {"stage": "tool_plan", "model_usage": tool_plan_res.usage}
+            tool_plan_provider = _provider_diagnostics_from_raw(tool_plan_res.raw)
+            if tool_plan_provider:
+                tool_plan_stage["provider"] = tool_plan_provider
+            stage_events.append(tool_plan_stage)
             usage = _accumulate_usage(usage, tool_plan_res.usage)
             parsed_plan_ok, parsed_plan, parse_reason = extract_first_json(tool_plan_res.text)
             tool_plan_answer = tool_plan_res.text or ""
@@ -627,8 +660,20 @@ class HarnessRuntime:
 
         final_response_text = final_res.text
         final_reasoning = final_res.reasoning
+        final_provider = _provider_diagnostics_from_raw(final_res.raw)
         usage = _accumulate_usage(usage, final_res.usage)
-        stage_events.append({"stage": "final_generate", "model_usage": final_res.usage, "reasoning": bool(final_reasoning)})
+        final_stage = {
+            "stage": "final_generate",
+            "model_usage": final_res.usage,
+            "reasoning": bool(final_reasoning),
+        }
+        if final_provider:
+            final_stage["provider"] = final_provider
+            if "finish_reason" in final_provider:
+                final_stage["finish_reason"] = final_provider["finish_reason"]
+            if "truncated" in final_provider:
+                final_stage["truncated"] = final_provider["truncated"]
+        stage_events.append(final_stage)
 
         schema_valid = True
         parse_error = []
@@ -679,10 +724,18 @@ class HarnessRuntime:
                         )
                     parse_ok, parsed_payload = _parse_and_validate(repair_res.text, final_schema)
                     final_response_text = repair_res.text if parse_ok else final_response_text
+                    if parse_ok:
+                        repair_provider = _provider_diagnostics_from_raw(repair_res.raw)
+                        if repair_provider:
+                            final_provider = repair_provider
                     schema_valid = parse_ok
                     usage = _accumulate_usage(usage, repair_res.usage)
                     parse_error = parsed_payload.get("errors", []) if not parse_ok else []
-                    stage_events.append({"stage": "repair_retry", "model_usage": repair_res.usage})
+                    repair_stage = {"stage": "repair_retry", "model_usage": repair_res.usage}
+                    repair_provider = _provider_diagnostics_from_raw(repair_res.raw)
+                    if repair_provider:
+                        repair_stage["provider"] = repair_provider
+                    stage_events.append(repair_stage)
                     tool_plan_answer = tool_plan_answer or repair_res.text
 
         evidence_rows = _build_evidence_rows(
@@ -740,6 +793,7 @@ class HarnessRuntime:
             prompt_version=self.config.prompt_version,
             evidence=evidence_ids_for_response,
             tool_plan=tool_plan_answer,
+            provider=final_provider,
         )
 
         latency_ms = int((time.perf_counter() - start) * 1000)
@@ -764,28 +818,38 @@ class HarnessRuntime:
                 "tool_sandbox_mode": self.tool_sandbox_mode,
             }
         )
+        if final_provider:
+            response.update({key: final_provider.get(key) for key in PROVIDER_DIAGNOSTIC_KEYS if key in final_provider})
+            finish_reason = final_provider.get("finish_reason")
+            if isinstance(finish_reason, str) and finish_reason:
+                response["choices"][0]["finish_reason"] = finish_reason
+            if "truncated" in final_provider:
+                response["truncated"] = bool(final_provider["truncated"])
+            if "reasoning_extracted" in final_provider:
+                response["reasoning_extracted"] = bool(final_provider["reasoning_extracted"])
         if parsed_payload is not None and final_schema is not None:
             response["parsed"] = parsed_payload
 
         if self.cache is not None and status == "ok":
-            self.cache.put(
-                cache_key_payload,
-                {
-                    "id": request_id,
-                    "object": "chat.completion",
-                    "model": model,
-                    "choices": response["choices"],
-                    "usage": response["usage"],
-                    "policy": route.as_dict(),
-                    "route": route.route.value,
-                    "status": status,
-                    "cached": False,
-                    "run_id": run_id,
-                    "checkpoint_id": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
-                    "validation": validation,
-                    "trace_checkpoint_count": len(self.checkpoint_refs),
-                },
-            )
+            cache_value = {
+                "id": request_id,
+                "object": "chat.completion",
+                "model": model,
+                "choices": response["choices"],
+                "usage": response["usage"],
+                "meta": response.get("meta", {}),
+                "policy": route.as_dict(),
+                "route": route.route.value,
+                "status": status,
+                "cached": False,
+                "run_id": run_id,
+                "checkpoint_id": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
+                "validation": validation,
+                "trace_checkpoint_count": len(self.checkpoint_refs),
+            }
+            if final_provider:
+                cache_value.update({key: final_provider.get(key) for key in PROVIDER_DIAGNOSTIC_KEYS if key in final_provider})
+            self.cache.put(cache_key_payload, cache_value)
 
         checkpoints_payload = self._load_checkpoint_payloads()
         trace = TraceEvent(
@@ -809,6 +873,7 @@ class HarnessRuntime:
                 "usage": usage,
                 "evidence_ids": evidence_ids_for_response,
                 "tool_calls": len(tool_call_payloads),
+                "provider": final_provider,
             },
         )
         self.trace_store.write(trace)
@@ -1062,6 +1127,31 @@ def _accumulate_usage(base: dict[str, int], addition: dict[str, int]) -> dict[st
     return merged
 
 
+def _provider_diagnostics_from_raw(raw: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+
+    candidate = raw.get("provider")
+    if not isinstance(candidate, dict):
+        meta = raw.get("meta")
+        if isinstance(meta, dict):
+            candidate = meta.get("provider")
+    if not isinstance(candidate, dict):
+        candidate = {key: raw.get(key) for key in PROVIDER_DIAGNOSTIC_KEYS if key in raw}
+
+    diagnostics = {
+        key: candidate.get(key)
+        for key in PROVIDER_DIAGNOSTIC_KEYS
+        if key in candidate and candidate.get(key) is not None
+    }
+    if not diagnostics:
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key, value in diagnostics.items():
+        sanitized[key] = redact_sensitive_args(value) if isinstance(value, str) else value
+    return sanitized
+
+
 def _tool_result_payload(res: ToolCallResult) -> dict[str, Any]:
     safe_output = redact_sensitive_args(res.output)
     safe_args = redact_sensitive_args(res.args)
@@ -1162,12 +1252,25 @@ def _build_openai_like_response(
     prompt_version: str,
     evidence: list[str],
     tool_plan: str,
+    provider: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     msg = {"role": "assistant", "content": text}
     if route.allow_reasoning and reasoning:
         msg["reasoning"] = reasoning
     if tool_plan and route.use_tools:
         msg["tool_plan"] = tool_plan
+    meta = {
+        "route": route.route.value,
+        "trace_id": trace_id,
+        "policy_version": policy_version,
+        "prompt_version": prompt_version,
+        "evidence_count": len(evidence),
+        "route_confidence": route.confidence,
+        "route_confidence_gap": route.confidence_gap,
+        "route_metadata": route.route_metadata,
+    }
+    if provider:
+        meta["provider"] = provider
     return {
         "id": request_id,
         "object": "chat.completion",
@@ -1179,16 +1282,7 @@ def _build_openai_like_response(
             "completion_tokens": usage.get("output_tokens", 0),
             "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
         },
-        "meta": {
-            "route": route.route.value,
-            "trace_id": trace_id,
-            "policy_version": policy_version,
-            "prompt_version": prompt_version,
-            "evidence_count": len(evidence),
-            "route_confidence": route.confidence,
-            "route_confidence_gap": route.confidence_gap,
-            "route_metadata": route.route_metadata,
-        },
+        "meta": meta,
     }
 
 

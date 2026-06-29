@@ -34,17 +34,25 @@ Recommended rollout controls:
 
 - Demo run:
   - `python real_ai_harness.py --query "..." --no-network`
-- Local OpenAI-compatible provider + production runtime (from-scratch):
+- Harness-owned local provider + production runtime with a downloaded model:
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
-  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "local-foundation:v1"`
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "my-hf-model" -Backend auto -ModelPath "C:\models\my-hf-model" -LocalOnly`
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "hf://meta-llama/Llama-3.1-8B-Instruct" -Backend auto -LocalOnly`
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "my-gguf-model" -Backend auto -ModelPath "C:\models\my-model.gguf" -LlamaCppGpuLayers 0 -LocalOnly`
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "qwen3:4b" -Backend auto -ModelsRoot "$env:USERPROFILE\.ollama\models" -LocalOnly`
   - `Start-HarnessBackend -ExecutionMode local -Config harness.yaml -WaitSeconds 30`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -Config harness.yaml -UseExistingServer -AnswerOnly`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What are the top 3 N64 games of all time?" -Config harness.yaml -UseExistingServer -Property answer,generation_backend,finish_reason,truncated,reasoning_extracted,provider_warning`
   - `Get-HarnessOwnLLMBackendStatus -IncludeSession`
   - `Get-HarnessBackendStatus -Config harness.yaml`
-  - `Stop-HarnessBackend -ExecutionMode local -Config harness.yaml`
+  - `Stop-HarnessStack -Config harness.yaml -ModelBackendPort 11435`
+- Diagnostic stub provider (deterministic fallback, not a real LLM):
+  - `. .\scripts\Invoke-HarnessOneShot.ps1`
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "local-foundation:v1" -Backend fallback`
+  - `Get-HarnessOwnLLMBackendStatus -ModelBackendPort 11435 -AsJson`
   - `Stop-HarnessOwnLLMBackend -ModelBackendPort 11435`
 
-- Optional containerized provider stack (NVIDIA NIM by default; Ollama remains explicit legacy opt-in):
+- Optional OpenAI-compatible transport stack (legacy/explicit opt-in, not the harness-owned model path):
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
   - `Start-HarnessBackend -ExecutionMode containerized -Config harness.yaml -EnvFile .env.nvidia`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -UseExistingServer`
@@ -54,7 +62,7 @@ Recommended rollout controls:
   - `Start-HarnessBackend -ExecutionMode local -Config harness.yaml`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the most played music video ever?" -UseExistingServer`
   - `Get-HarnessBackendStatus -Config harness.yaml`
-  - `Stop-HarnessBackend -ExecutionMode local -Config harness.yaml`
+  - `Stop-HarnessStack -Config harness.yaml`
 - NVIDIA container lifecycle template:
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
   - `Start-HarnessBackend -ExecutionMode containerized -Config harness-nvidia.yaml -EnvFile .env.nvidia`
@@ -65,7 +73,7 @@ Recommended rollout controls:
   - `. .\scripts\Invoke-HarnessOneShot.ps1`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -FeatureLevel hardening -RequireEvidence -ToolSandbox off -AnswerOnly`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?"`
-  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -Property answer,status,model,route`
+  - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" -Property answer,status,model,route,generation_backend,finish_reason,truncated,provider_warning`
   - `Invoke-HarnessOneShot -Mode runtime -Question "What is the capital of France?" | ConvertTo-Json -Depth 20`
   - `Invoke-HarnessOneShot -Mode demo -Question "What is the best way to write tests?" -NoNetwork`
 - Use the helper parameters above instead of manual `$env:` assignments in the same one-liner; passing `-FeatureLevel`, `-RequireEvidence`, `-ToolSandbox`, and `-EnableAdvancedRouter` directly avoids PowerShell parsing edge cases.
@@ -75,6 +83,9 @@ Recommended rollout controls:
   - `Get-HarnessBackendStatus -Config harness.yaml -PreferProviderOnly`
   - `Get-HarnessBackendStatus -Config harness.yaml -AsJson`
   - `Get-HarnessBackendStatus -Config harness.yaml | Format-List -Property * -Force`
+- Full local shutdown:
+  - `Stop-HarnessStack -Config harness.yaml -ModelBackendPort 11435`
+  - `Stop-HarnessStack -All` stops every tracked local runtime/backend session and every tracked model-backend session.
 - `Get-HarnessBackendStatus` reports runtime `/health` and provider model-catalog availability, with `-PreferProviderOnly` providing a provider-only health check.
 - Baseline/parity scripts:
   - `python scripts/run_parity_sanity.py --print-json`
@@ -86,9 +97,9 @@ Current backends are:
 
 - `openai` (default) – any OpenAI-compatible HTTP endpoint
 - `local_openai` – alias used for your own local OpenAI-compatible service (for example `harness.local_model_provider`)
-- `llamacpp` – direct local GGUF via `llama-cpp-python`
-- `nvidia_nim` (`nim`, `nvidia`, `nvidia-nim`) – NVIDIA NIM serving endpoints (local GPU or remote), including containerized local setups
-- `ollama` – Ollama OpenAI-compatible endpoint (legacy/explicit opt-in containerized path only)
+- `llamacpp` – direct local GGUF via `llama-cpp-python`, including GGUF blobs resolved from a local Ollama-style model store without starting Ollama
+- `nvidia_nim` (`nim`, `nvidia`, `nvidia-nim`) – NVIDIA NIM OpenAI-compatible transport (legacy/explicit opt-in when you intentionally want that runtime)
+- `ollama` – Ollama OpenAI-compatible endpoint (legacy/explicit opt-in only; not used by the harness-owned local model provider)
 
 ## Install
 
@@ -218,22 +229,43 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8080/v1/chat/completions" -Method Post 
 - When `-Model` is omitted in runtime mode, the generated payload does **not** include `model`; the server uses config/runtime defaults, which avoids model/request-body mismatches.
 - PowerShell helpers return rich objects by default. Use `-Property`/`-Properties`, `-ExpandProperty`, `-AnswerOnly`, or `-AsJson` for focused interactive output without changing the HTTP response contract.
 - Use `Format-List -Property * -Force` or `ConvertTo-Json -Depth 20` at the pipeline when you want to inspect every nested field.
+- Start cmdlets accept `-PythonPath`; if omitted, they prefer `.\.venv\Scripts\python.exe` when present, then `python` on `PATH`.
+- Local start results and `Get-HarnessOwnLLMBackendStatus -IncludeSession` include retained `stdout_log` and `stderr_log` paths under `state\logs`.
 - If you see provider errors during runtime mode, start with `Get-HarnessBackendStatus -PreferProviderOnly` to verify provider reachability and model presence independently of runtime health.
 
 ### Local provider troubleshooting
 
 - The default local flow uses your own provider implementation (`harness.local_model_provider`) on `127.0.0.1:11435`.
 - `model_backend_unavailable` usually means the provider plane is down (for example, local backend not started).
-- Start/verify/stop the local provider with:
-  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "local-foundation:v1"`
+- Start/verify/stop a real local Hugging Face/Transformers model with:
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "my-model" -Backend auto -ModelPath "C:\models\my-model" -LocalOnly`
   - `Get-HarnessOwnLLMBackendStatus -ModelBackendPort 11435`
   - `Stop-HarnessOwnLLMBackend -ModelBackendPort 11435`
-- To launch your downloaded model directly from a local folder (no Ollama dependency):
-  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "my-model" -Backend transformers -ModelPath "C:\\models\\my-model" -LocalOnly`
+- Start a model ID that is already present in the local Hugging Face cache, including `hf://` IDs commonly used by NIM configs:
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "hf://meta-llama/Llama-3.1-8B-Instruct" -Backend auto -LocalOnly`
+  - The provider passes `meta-llama/Llama-3.1-8B-Instruct` to Transformers with `local_files_only=True`; it does not call NVIDIA NIM, NGC, Hugging Face Hub, or any remote serving API.
+- Start a direct local GGUF model through the harness-owned provider with:
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "my-gguf-model" -Backend auto -ModelPath "C:\models\my-model.gguf" -LlamaCppGpuLayers 0 -LocalOnly`
+- Start a downloaded Ollama-style model without running Ollama by pointing at the local model store:
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "qwen3:4b" -Backend auto -ModelsRoot "$env:USERPROFILE\.ollama\models" -LocalOnly`
+  - The provider reads `manifests` and `blobs` directly, applies recognized Ollama template/params layers, and serves the resolved GGUF with `llama-cpp-python`; it does not call `ollama`, `ollama serve`, Docker, or the Ollama HTTP API.
+  - For Qwen3, normal non-reasoning requests add `/no_think` and strip any `<think>...</think>` block into a separate reasoning field so `answer` stays clean.
+- Start the deterministic diagnostic fallback explicitly with:
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "local-foundation:v1" -Backend fallback`
+  - `Start-HarnessOwnLLMBackend -ModelBackendPort 11435 -Model "local-foundation:v1" -AllowFallback`
+- Stop the full local runtime + provider stack with:
+  - `Stop-HarnessStack -Config harness.yaml -ModelBackendPort 11435`
+- If an answer says `I received your question: ...`, check `generation_backend` and `provider_warning`; that response comes from deterministic fallback/stub mode, not a real LLM.
+- If `truncated` is `true` or `finish_reason` is `length`, raise `-MaxNewTokens` on the model backend or request a shorter answer.
+- If `reasoning_extracted` is `true`, hidden thinking text was separated from `choices[0].message.content`; inspect full JSON only when you intentionally need diagnostics.
+- `local_model_loaded` is kept for compatibility. Prefer `model_source_present`, `model_load_attempted`, `model_load_succeeded`, `last_load_error`, and `last_generation_error` when diagnosing real model startup/generation.
 - Keep `backend.base_url` at `http://127.0.0.1:11435/v1` for local non-container runs.
+- For local GGUF/Ollama-store execution, install the optional llama.cpp runtime in your active environment: `python -m pip install "llama-cpp-python"`.
+- For local Hugging Face folder execution, install the optional Transformers runtime in your active environment: `python -m pip install "transformers" "torch"`.
+- `Get-HarnessOwnLLMBackendStatus -AsJson` reports `runtime_dependency` and `runtime_dependency_available`; if the dependency is missing, install it before expecting a real model answer.
 - If you switch to containerized providers later, use `Start-HarnessBackend -ExecutionMode containerized`.
 
-For this repository's default path, you keep full control over provider choice via `harness.yaml`; Ollama remains opt-in and is never implicitly started.
+For this repository's default path, you keep full control over provider choice via `harness.yaml`; Ollama remains opt-in as an external transport and is never implicitly started by the harness-owned provider.
 
 ## Runtime config (`harness.yaml`)
 

@@ -47,7 +47,12 @@ def _build_runtime() -> tuple[HarnessRuntime, RealHarnessEngine]:
 
 
 @pytest.mark.asyncio
-async def test_parity_baseline_matches_runtime_contract_shape() -> None:
+async def test_parity_baseline_matches_runtime_contract_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        RealHarnessEngine,
+        "_tool_run_tests",
+        lambda self, args: {"tool": "run_tests", "success": True, "output": {"returncode": 0}},
+    )
     real_cases = _load_cases(Path("tests/fixtures/baseline/real_ai/queries.json"))
     runtime_cases = _load_cases(Path("tests/fixtures/baseline/runtime/queries.json"))
     common = [case.query for case in real_cases if any(r.query == case.query for r in runtime_cases)]

@@ -4,7 +4,7 @@ import json
 import pytest
 from harness.tools import ToolCallResult
 from harness.config import load_runtime_config
-from harness.runtime import HarnessRuntime
+from harness.runtime import HarnessRuntime, RESPONSE_NORMALIZATION_VERSION
 from harness.router import Route, RoutePolicy
 from harness.types import ModelGenerateRequest, ModelGenerateResult
 from harness import runtime as runtime_module
@@ -129,6 +129,171 @@ def test_run_tool_in_sandbox_reports_docker_execution(monkeypatch: pytest.Monkey
     assert result.success is True
     assert result.error_code is None
     assert result.error is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_carries_provider_diagnostics_to_response_trace_and_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    provider = {
+        "configured_backend": "auto",
+        "generation_backend": "fallback",
+        "model_source": None,
+        "local_model_loaded": False,
+        "model_source_present": False,
+        "model_load_attempted": False,
+        "model_load_succeeded": False,
+        "template_applied": False,
+        "fallback_active": True,
+        "finish_reason": "stop",
+        "truncated": False,
+        "reasoning_extracted": True,
+        "provider_warning": "Deterministic fallback provider is active. This is diagnostic stub mode, not a real LLM.",
+    }
+
+    class _MockClient:
+        async def generate(self, req: ModelGenerateRequest) -> ModelGenerateResult:
+            return ModelGenerateResult(
+                text="Clean answer",
+                reasoning="hidden reasoning",
+                raw={"provider": provider},
+                usage={"input_tokens": 3, "output_tokens": 5},
+            )
+
+    config = load_runtime_config()
+    config.feature_level = "basic"
+    config.require_evidence = False
+    config.tool_allowlist = ()
+    config.enable_cache = True
+    config.trace_dir = tmp_path / "traces"
+    config.cache_dir = tmp_path / "cache"
+    config.state_dir = tmp_path / "state"
+
+    runtime = HarnessRuntime(config, _MockClient())
+    forced_route = RoutePolicy(
+        route=Route.DIRECT,
+        use_retrieval=False,
+        use_tools=False,
+        strict_schema=False,
+        require_verification=False,
+        allow_reasoning=False,
+        thinking_budget="low",
+        max_model_calls=1,
+        temperature=0.2,
+        max_new_tokens=64,
+        allowed_tools=(),
+        max_tool_calls_per_turn=0,
+        required_evidence_fields=(),
+        hard_fail_errors=(),
+        tool_sandbox_required=(),
+        route_metadata={},
+    )
+    monkeypatch.setattr(runtime_module, "classify_route", lambda *_args, **_kwargs: forced_route)
+
+    response = await runtime.process(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": str(runtime.config.model),
+            "response_schema": None,
+            "request_id": "runtime-provider-diagnostics",
+            "toolset": [],
+        }
+    )
+
+    assert response["status"] == "ok"
+    assert response["meta"]["provider"]["generation_backend"] == "fallback"
+    assert response["choices"][0]["message"]["content"] == "Clean answer"
+    assert "reasoning" not in response["choices"][0]["message"]
+    assert response["generation_backend"] == "fallback"
+    assert response["fallback_active"] is True
+    assert response["reasoning_extracted"] is True
+    assert response["truncated"] is False
+    assert response["provider_warning"] == provider["provider_warning"]
+    assert response["stages"][0]["provider"]["generation_backend"] == "fallback"
+    assert response["stages"][0]["finish_reason"] == "stop"
+
+    trace = json.loads((config.trace_dir / "runtime-provider-diagnostics.json").read_text(encoding="utf-8"))
+    assert trace["stages"][0]["provider"]["generation_backend"] == "fallback"
+    assert trace["result_summary"]["provider"]["fallback_active"] is True
+
+    cache_files = list(config.cache_dir.glob("*.json"))
+    assert cache_files
+    cached = json.loads(cache_files[0].read_text(encoding="utf-8"))
+    assert cached["meta"]["provider"]["generation_backend"] == "fallback"
+    assert cached["provider_warning"] == provider["provider_warning"]
+    assert cached["reasoning_extracted"] is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_cache_key_includes_response_normalization_version(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class _MockClient:
+        async def generate(self, req: ModelGenerateRequest) -> ModelGenerateResult:
+            return ModelGenerateResult(
+                text="answer",
+                reasoning=None,
+                raw={},
+                usage={"input_tokens": 1, "output_tokens": 1},
+            )
+
+    class _Cache:
+        def __init__(self) -> None:
+            self.get_payload: dict[str, object] | None = None
+
+        def get(self, payload: dict[str, object]) -> None:
+            self.get_payload = payload
+            return None
+
+        def put(self, payload: dict[str, object], value: dict[str, object]) -> str:
+            return "cache-key"
+
+    config = load_runtime_config()
+    config.feature_level = "basic"
+    config.require_evidence = False
+    config.tool_allowlist = ()
+    config.enable_cache = True
+    config.trace_dir = tmp_path / "traces"
+    config.cache_dir = tmp_path / "cache"
+    config.state_dir = tmp_path / "state"
+
+    runtime = HarnessRuntime(config, _MockClient())
+    cache = _Cache()
+    runtime.cache = cache
+    forced_route = RoutePolicy(
+        route=Route.DIRECT,
+        use_retrieval=False,
+        use_tools=False,
+        strict_schema=False,
+        require_verification=False,
+        allow_reasoning=False,
+        thinking_budget="low",
+        max_model_calls=1,
+        temperature=0.2,
+        max_new_tokens=64,
+        allowed_tools=(),
+        max_tool_calls_per_turn=0,
+        required_evidence_fields=(),
+        hard_fail_errors=(),
+        tool_sandbox_required=(),
+        route_metadata={},
+    )
+    monkeypatch.setattr(runtime_module, "classify_route", lambda *_args, **_kwargs: forced_route)
+
+    await runtime.process(
+        {
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": str(runtime.config.model),
+            "response_schema": None,
+            "request_id": "runtime-cache-version",
+            "toolset": [],
+        }
+    )
+
+    assert cache.get_payload is not None
+    assert cache.get_payload["response_normalization_version"] == RESPONSE_NORMALIZATION_VERSION
 
 
 @pytest.mark.asyncio
