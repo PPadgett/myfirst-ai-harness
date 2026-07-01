@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import asyncio
 import os
 import subprocess
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.adapters.base import BaseModelClient
-from harness.config import RuntimeConfig
+from harness.config import BackendConfig, RuntimeConfig
 from harness.manifest_schema import load_route_manifest
 from harness.evidence import Claim
 from harness.execution_state import write_checkpoint
@@ -31,7 +32,7 @@ from harness.guards import (
 from harness.router import RoutePolicy, Route, classify_route
 from harness.tools import ToolCallResult, execute_tool, specs_as_openai_tools
 from harness.trace_cache import ResponseCache, TraceEvent, TraceStore
-from harness.types import ModelGenerateRequest
+from harness.types import ModelGenerateRequest, ModelGenerateResult
 from harness.validation import extract_first_json, validate_schema
 from harness.retrieval import DirectoryCorpusRetriever, RetrievedDoc, SimpleReranker, pack_context
 
@@ -81,14 +82,32 @@ class ModelArtifact:
     latency_ms: int
 
 
+@dataclass
+class BackendBinding:
+    backend_id: str
+    device: str
+    device_mode: str
+    model: str
+    client: BaseModelClient
+    config: BackendConfig | None = None
+
+
 class HarnessRuntime:
     def __init__(
         self,
         config: RuntimeConfig,
-        model_client: BaseModelClient,
+        model_client: BaseModelClient | dict[str, BaseModelClient],
     ) -> None:
         self.config = config
-        self.model_client = model_client
+        if isinstance(model_client, dict):
+            self.model_clients = dict(model_client)
+            first_client = next(iter(self.model_clients.values()), None)
+            if first_client is None:
+                raise ValueError("At least one model client is required")
+            self.model_client = first_client
+        else:
+            self.model_clients = {}
+            self.model_client = model_client
         self.retriever = DirectoryCorpusRetriever(config.corpus_dir)
         self.reranker = SimpleReranker()
         self.trace_store = TraceStore(config.trace_dir)
@@ -109,6 +128,310 @@ class HarnessRuntime:
         self.last_run_id: str | None = None
         self.trace_id: str | None = None
         self._last_checkpoint_state: dict[str, Any] = {}
+
+    def _backend_bindings(self) -> list[BackendBinding]:
+        if self.config.backends:
+            bindings: list[BackendBinding] = []
+            for backend in self.config.backends:
+                backend_id = backend.backend_id or backend.device or backend.name
+                client = (
+                    self.model_clients.get(backend_id)
+                    or self.model_clients.get(backend.device)
+                    or self.model_clients.get(backend.name)
+                )
+                if client is None:
+                    continue
+                bindings.append(
+                    BackendBinding(
+                        backend_id=backend_id,
+                        device=backend.device or backend_id,
+                        device_mode=backend.device_mode or backend.device or backend_id,
+                        model=backend.model or self.config.model,
+                        client=client,
+                        config=backend,
+                    )
+                )
+            if bindings:
+                return bindings
+        backend = self.config.backend
+        return [
+            BackendBinding(
+                backend_id=backend.backend_id or backend.device or backend.name,
+                device=backend.device or backend.backend_id or backend.name,
+                device_mode=backend.device_mode or backend.device or backend.backend_id or backend.name,
+                model=backend.model or self.config.model,
+                client=self.model_client,
+                config=backend,
+            )
+        ]
+
+    @staticmethod
+    def _normalize_execution_profile(raw: Any) -> str:
+        text = str(raw or "").strip().lower().replace("-", "_")
+        aliases = {
+            "": "",
+            "npu": "npu_only",
+            "npu_only": "npu_only",
+            "npuonly": "npu_only",
+            "gpu": "gpu",
+            "gpu_only": "gpu",
+            "cpu": "cpu",
+            "cpu_only": "cpu",
+            "hybrid": "hybrid_npu_igpu",
+            "npu_igpu": "hybrid_npu_igpu",
+            "hybrid_npu_igpu": "hybrid_npu_igpu",
+            "agentic": "agentic_parallel",
+            "agentic_parallel": "agentic_parallel",
+        }
+        return aliases.get(text, text)
+
+    @staticmethod
+    def _device_to_profile(device: str) -> str:
+        normalized = str(device or "").strip().lower().replace("-", "_")
+        if normalized == "npu":
+            return "npu_only"
+        if normalized == "hybrid":
+            return "hybrid_npu_igpu"
+        if normalized in {"cpu", "gpu"}:
+            return normalized
+        return normalized
+
+    @staticmethod
+    def _profile_to_device(profile: str) -> str:
+        normalized = HarnessRuntime._normalize_execution_profile(profile)
+        if normalized == "npu_only":
+            return "npu"
+        if normalized == "hybrid_npu_igpu":
+            return "hybrid"
+        if normalized == "agentic_parallel":
+            return "cpu"
+        if normalized in {"cpu", "gpu"}:
+            return normalized
+        return normalized
+
+    @staticmethod
+    def _estimate_message_tokens(messages: list[dict[str, str]]) -> int:
+        chars = 0
+        for message in messages:
+            chars += len(str(message.get("content", "")))
+        return max(1, int((chars + 3) // 4))
+
+    def _route_backend_defaults(self, route: RoutePolicy) -> dict[str, Any]:
+        defaults = self.config.route_backend_defaults
+        if not isinstance(defaults, dict):
+            return {}
+        route_defaults = defaults.get(route.route.value, {})
+        return route_defaults if isinstance(route_defaults, dict) else {}
+
+    def _resolve_execution_profile(
+        self,
+        *,
+        requested_profile: Any,
+        route: RoutePolicy,
+        messages: list[dict[str, str]],
+        requested_max_tokens: int,
+    ) -> tuple[str, str]:
+        explicit = self._normalize_execution_profile(requested_profile)
+        if explicit:
+            return explicit, "request_override"
+
+        metadata_profile = self._normalize_execution_profile(route.route_metadata.get("execution_profile"))
+        if metadata_profile:
+            return metadata_profile, "route_metadata"
+
+        route_defaults = self._route_backend_defaults(route)
+        preferred_device = str(route_defaults.get("prefer_device", "") or "").strip()
+        if preferred_device:
+            return self._device_to_profile(preferred_device), "route_backend_defaults"
+
+        text = _last_user_text(messages).lower()
+        complex_markers = (
+            "story",
+            "worldbuilding",
+            "character arc",
+            "twist",
+            "revision",
+            "design",
+            "strategy",
+            "tradeoff",
+            "architecture",
+        )
+        if self.config.agentic_parallel_enabled and any(marker in text for marker in complex_markers):
+            return "agentic_parallel", "heuristic_complex_prompt"
+        if route.route == Route.TOOL_REQUIRED:
+            return "cpu", "heuristic_tool_route"
+        if route.route in {Route.STRUCTURED_EXTRACTION, Route.CODE_OR_DATA}:
+            return "gpu", "heuristic_route"
+        if route.route == Route.GROUNDED_QA or requested_max_tokens >= 1024:
+            return "hybrid_npu_igpu", "heuristic_context"
+        return "npu_only", "heuristic_default"
+
+    @staticmethod
+    def _binding_matches_device(binding: BackendBinding, device: str) -> bool:
+        target = str(device or "").strip().lower()
+        backend_id = binding.backend_id.lower()
+        primary_device = binding.device.lower()
+        device_mode = binding.device_mode.lower()
+        if target == "hybrid":
+            return "hybrid" in {backend_id, primary_device} or "hybrid" in device_mode or "npu_igpu" in device_mode
+        return target in {backend_id, primary_device, device_mode}
+
+    def _ordered_backend_plan(self, route: RoutePolicy, profile: str) -> list[BackendBinding]:
+        bindings = self._backend_bindings()
+        route_defaults = self._route_backend_defaults(route)
+        target_device = self._profile_to_device(profile)
+        fallback_chain = route_defaults.get("fallback_chain", [])
+        ordered_devices: list[str] = []
+        if profile == "agentic_parallel":
+            ordered_devices.extend(["cpu", "npu", "gpu", "hybrid"])
+        elif target_device:
+            ordered_devices.append(target_device)
+        if isinstance(fallback_chain, list):
+            ordered_devices.extend(str(item).strip().lower() for item in fallback_chain if str(item).strip())
+        ordered_devices.extend(binding.device.lower() for binding in bindings)
+
+        plan: list[BackendBinding] = []
+        seen: set[str] = set()
+        for device in ordered_devices:
+            for binding in bindings:
+                if binding.backend_id in seen:
+                    continue
+                if self._binding_matches_device(binding, device):
+                    plan.append(binding)
+                    seen.add(binding.backend_id)
+        for binding in bindings:
+            if binding.backend_id not in seen:
+                plan.append(binding)
+        return plan or bindings
+
+    @staticmethod
+    def _backend_plan_payload(plan: list[BackendBinding], selected_backend_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "backend_id": binding.backend_id,
+                "device": binding.device,
+                "device_mode": binding.device_mode,
+                "model": binding.model,
+                "selected": binding.backend_id == selected_backend_id,
+            }
+            for binding in plan
+        ]
+
+    async def _run_agentic_parallel(
+        self,
+        *,
+        prompt_messages: list[dict[str, str]],
+        requested_temp: float,
+        requested_max_tokens: int,
+        final_schema: dict[str, Any] | None,
+        fallback_controller: BackendBinding,
+    ) -> tuple[ModelGenerateResult, dict[str, Any], BackendBinding]:
+        bindings = self._backend_bindings()
+        controller = next((binding for binding in bindings if self._binding_matches_device(binding, "cpu")), fallback_controller)
+        worker_candidates = [
+            binding
+            for binding in bindings
+            if binding.backend_id != controller.backend_id
+            and (
+                self._binding_matches_device(binding, "npu")
+                or self._binding_matches_device(binding, "gpu")
+                or self._binding_matches_device(binding, "hybrid")
+            )
+        ]
+        max_workers = max(1, int(self.config.agentic_parallel_max_workers or 2))
+        worker_candidates = worker_candidates[:max_workers]
+
+        async def _worker(binding: BackendBinding) -> dict[str, Any]:
+            worker_messages = list(prompt_messages)
+            worker_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Parallel worker task: produce a concise, high-signal draft for the final controller. "
+                        "Focus on useful substance; do not mention benchmark internals."
+                    ),
+                }
+            )
+            req = ModelGenerateRequest(
+                model=binding.model,
+                messages=worker_messages,
+                temperature=requested_temp,
+                max_new_tokens=max(128, min(512, requested_max_tokens // 2)),
+                response_schema=None,
+                allow_reasoning=False,
+            )
+            started = time.perf_counter()
+            try:
+                result = await binding.client.generate(req)
+                return {
+                    "backend_id": binding.backend_id,
+                    "device": binding.device,
+                    "status": "ok",
+                    "runtime_ms": int((time.perf_counter() - started) * 1000),
+                    "usage": result.usage,
+                    "text": result.text,
+                }
+            except RuntimeError as exc:
+                return {
+                    "backend_id": binding.backend_id,
+                    "device": binding.device,
+                    "status": "failed",
+                    "runtime_ms": int((time.perf_counter() - started) * 1000),
+                    "error": str(exc),
+                    "text": "",
+                }
+
+        worker_results = await asyncio.gather(*[_worker(binding) for binding in worker_candidates])
+        accepted = [result for result in worker_results if result.get("status") == "ok" and str(result.get("text", "")).strip()]
+        worker_summaries = "\n\n".join(
+            f"[{result['backend_id']}]\n{str(result.get('text', ''))[:3000]}" for result in accepted
+        )
+        controller_messages = list(prompt_messages)
+        controller_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Controller task: synthesize the best final answer from these parallel worker drafts. "
+                    "Return only the final answer.\n\n"
+                    f"{worker_summaries or '[no successful worker drafts]'}"
+                ),
+            }
+        )
+        controller_req = ModelGenerateRequest(
+            model=controller.model,
+            messages=controller_messages,
+            temperature=requested_temp,
+            max_new_tokens=requested_max_tokens,
+            response_schema=final_schema,
+            allow_reasoning=False,
+        )
+        controller_started = time.perf_counter()
+        controller_result = await controller.client.generate(controller_req)
+        controller_runtime_ms = int((time.perf_counter() - controller_started) * 1000)
+        agentic_metadata = {
+            "enabled": True,
+            "controller_backend": controller.backend_id,
+            "controller_device": controller.device,
+            "worker_count": len(worker_results),
+            "accepted_results": len(accepted),
+            "workers": [
+                {
+                    key: value
+                    for key, value in result.items()
+                    if key in {"backend_id", "device", "status", "runtime_ms", "usage", "error"}
+                }
+                for result in worker_results
+            ],
+            "stages": [
+                {
+                    "stage": "agentic_parallel",
+                    "controller_backend": controller.backend_id,
+                    "worker_count": len(accepted),
+                    "controller_runtime_ms": controller_runtime_ms,
+                }
+            ],
+        }
+        return controller_result, agentic_metadata, controller
 
     def _normalize_model_error(self, exc: BaseException) -> str:
         text = str(exc).lower()
@@ -353,6 +676,7 @@ class HarnessRuntime:
         )
         if not route.allowed_tools:
             route.use_tools = False
+        requested_execution_profile = request.get("execution_profile")
 
         # Cache key excludes volatile outputs.
         cache_key_payload = {
@@ -365,6 +689,7 @@ class HarnessRuntime:
             "route_override": route_override,
             "run_id": run_id,
             "toolset": requested_toolset or [],
+            "execution_profile": requested_execution_profile or "",
         }
 
         cache_hit = None
@@ -388,11 +713,26 @@ class HarnessRuntime:
         requested_temp = float(request.get("temperature", route.temperature))
         requested_temp = min(2.0, max(0.0, requested_temp))
         requested_max_tokens = max(64, requested_max_tokens)
+        execution_profile, profile_source = self._resolve_execution_profile(
+            requested_profile=requested_execution_profile,
+            route=route,
+            messages=messages,
+            requested_max_tokens=requested_max_tokens,
+        )
+        route.route_metadata["execution_profile"] = execution_profile
+        route.route_metadata["execution_profile_source"] = profile_source
+        route.route_metadata["requested_context_tokens"] = self._estimate_message_tokens(messages)
+        backend_plan = self._ordered_backend_plan(route, execution_profile)
+        selected_binding = backend_plan[0]
+        selected_client = selected_binding.client
+        selected_model = selected_binding.model or model
+        selected_via = profile_source or "route_selection"
 
         tool_attempts = 0
         stage_events: list[dict[str, Any]] = []
         usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
         parsed_payload: dict[str, Any] | None = None
+        agentic_parallel_metadata: dict[str, Any] | None = None
 
         docs: list[RetrievedDoc] = []
         evidence_ids: list[str] = []
@@ -423,7 +763,7 @@ class HarnessRuntime:
             )
             tool_plan_schema = _tool_schema(route.allowed_tools)
             tool_plan_req = ModelGenerateRequest(
-                model=model,
+                model=selected_model,
                 messages=tool_prompt,
                 temperature=min(0.2, requested_temp),
                 max_new_tokens=min(512, max(128, requested_max_tokens // 4)),
@@ -432,7 +772,7 @@ class HarnessRuntime:
                 allow_reasoning=False,
             )
             try:
-                tool_plan_res = await self.model_client.generate(tool_plan_req)
+                tool_plan_res = await selected_client.generate(tool_plan_req)
             except RuntimeError as exc:
                 error_code = self._normalize_model_error(exc)
                 self._checkpoint(
@@ -447,7 +787,7 @@ class HarnessRuntime:
                 return self._backend_failure_response(
                     request_id=request_id,
                     route=route,
-                    model=model,
+                    model=selected_model,
                     run_id=run_id,
                     validation_reason=str(exc),
                     error_code=error_code,
@@ -624,17 +964,28 @@ class HarnessRuntime:
 
         final_schema = response_schema if route.output_schema_required or route.strict_schema else None
         final_msg_prompt = prompt_messages.copy()
-        final_req = ModelGenerateRequest(
-            model=model,
-            messages=final_msg_prompt,
-            temperature=requested_temp if not route.strict_schema else min(0.2, requested_temp),
-            max_new_tokens=requested_max_tokens,
-            response_schema=final_schema,
-            allow_reasoning=route.allow_reasoning,
-            reasoning_budget_tokens=_budget_tokens(route.thinking_budget),
-        )
         try:
-            final_res = await self.model_client.generate(final_req)
+            if execution_profile == "agentic_parallel" and self.config.agentic_parallel_enabled:
+                final_res, agentic_parallel_metadata, selected_binding = await self._run_agentic_parallel(
+                    prompt_messages=final_msg_prompt,
+                    requested_temp=requested_temp if not route.strict_schema else min(0.2, requested_temp),
+                    requested_max_tokens=requested_max_tokens,
+                    final_schema=final_schema,
+                    fallback_controller=selected_binding,
+                )
+                selected_client = selected_binding.client
+                selected_model = selected_binding.model or model
+            else:
+                final_req = ModelGenerateRequest(
+                    model=selected_model,
+                    messages=final_msg_prompt,
+                    temperature=requested_temp if not route.strict_schema else min(0.2, requested_temp),
+                    max_new_tokens=requested_max_tokens,
+                    response_schema=final_schema,
+                    allow_reasoning=route.allow_reasoning,
+                    reasoning_budget_tokens=_budget_tokens(route.thinking_budget),
+                )
+                final_res = await selected_client.generate(final_req)
         except RuntimeError as exc:
             error_code = self._normalize_model_error(exc)
             self._checkpoint(
@@ -649,7 +1000,7 @@ class HarnessRuntime:
             return self._backend_failure_response(
                 request_id=request_id,
                 route=route,
-                model=model,
+                model=selected_model,
                 run_id=run_id,
                 validation_reason=str(exc),
                 error_code=error_code,
@@ -690,9 +1041,9 @@ class HarnessRuntime:
                         }
                     ]
                     try:
-                        repair_res = await self.model_client.generate(
+                        repair_res = await selected_client.generate(
                             ModelGenerateRequest(
-                                model=model,
+                                model=selected_model,
                                 messages=repair_request,
                                 temperature=0.0,
                                 max_new_tokens=256,
@@ -714,7 +1065,7 @@ class HarnessRuntime:
                         return self._backend_failure_response(
                             request_id=request_id,
                             route=route,
-                            model=model,
+                            model=selected_model,
                             run_id=run_id,
                             validation_reason=str(exc),
                             error_code=error_code,
@@ -781,10 +1132,46 @@ class HarnessRuntime:
             payload={"validation": validation, "output_allow": output_decision.allow},
         )
 
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        tokens_per_second = 0.0
+        if latency_ms > 0 and output_tokens > 0:
+            tokens_per_second = round(output_tokens / (latency_ms / 1000.0), 4)
+        attempts = [
+            {
+                "backend_id": selected_binding.backend_id,
+                "device": selected_binding.device,
+                "model": selected_model,
+                "status": "ok" if status == "ok" else status,
+            }
+        ]
+        execution = {
+            "backend_id": selected_binding.backend_id,
+            "device": selected_binding.device,
+            "device_mode": selected_binding.device_mode,
+            "model": selected_model,
+            "profile": execution_profile,
+            "profile_source": profile_source,
+            "fallback_attempted": False,
+            "fallback_reason": "",
+            "attempts": attempts,
+            "selected_via": selected_via,
+            "wait_ms": 0,
+            "runtime_ms": latency_ms,
+            "ttft_ms": latency_ms,
+            "tokens_per_second": tokens_per_second,
+            "backend_plan": self._backend_plan_payload(backend_plan, selected_binding.backend_id),
+        }
+        if agentic_parallel_metadata is not None:
+            execution["agentic_parallel"] = agentic_parallel_metadata
+
+        final_provider = dict(final_provider or {})
+        final_provider["execution"] = execution
+
         response = _build_openai_like_response(
             request_id=request_id,
             trace_id=self.trace_id,
-            model=model,
+            model=selected_model,
             text=final_response_text,
             usage=usage,
             reasoning=final_reasoning if route.allow_reasoning else None,
@@ -796,7 +1183,6 @@ class HarnessRuntime:
             provider=final_provider,
         )
 
-        latency_ms = int((time.perf_counter() - start) * 1000)
         response.update(
             {
                 "status": status,
@@ -816,6 +1202,8 @@ class HarnessRuntime:
                 "stages": stage_events,
                 "feature_level": self.feature_level,
                 "tool_sandbox_mode": self.tool_sandbox_mode,
+                "execution": execution,
+                "provider": final_provider,
             }
         )
         if final_provider:
@@ -834,7 +1222,7 @@ class HarnessRuntime:
             cache_value = {
                 "id": request_id,
                 "object": "chat.completion",
-                "model": model,
+                "model": selected_model,
                 "choices": response["choices"],
                 "usage": response["usage"],
                 "meta": response.get("meta", {}),
@@ -846,6 +1234,8 @@ class HarnessRuntime:
                 "checkpoint_id": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
                 "validation": validation,
                 "trace_checkpoint_count": len(self.checkpoint_refs),
+                "execution": execution,
+                "provider": final_provider,
             }
             if final_provider:
                 cache_value.update({key: final_provider.get(key) for key in PROVIDER_DIAGNOSTIC_KEYS if key in final_provider})
@@ -855,7 +1245,7 @@ class HarnessRuntime:
         trace = TraceEvent(
             request_id=request_id,
             route=route.route.value,
-            model=model,
+            model=selected_model,
             policy_version=self.config.policy_version,
             prompt_version=self.config.prompt_version,
             status=status,
@@ -867,7 +1257,7 @@ class HarnessRuntime:
                 "latest_phase": checkpoints_payload[-1].get("phase") if checkpoints_payload else None,
                 "latest_state_diffs": checkpoints_payload[-1].get("state_diffs") if checkpoints_payload else {},
             },
-            request=redact_sensitive_args({"messages": messages, "model": model, "policy": route.as_dict(), "response_schema": response_schema}),
+            request=redact_sensitive_args({"messages": messages, "model": selected_model, "policy": route.as_dict(), "response_schema": response_schema}),
             result_summary={
                 "status": status,
                 "usage": usage,

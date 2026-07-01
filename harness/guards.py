@@ -75,6 +75,16 @@ def _compile(patterns: tuple[str, ...]) -> tuple[re.Pattern, ...]:
 
 _COMPILED_INPUT_PATTERNS = _compile(_INPUT_PATTERNS)
 _COMPILED_COMMAND_PATTERNS = _compile(_COMMAND_ABUSE_PATTERNS)
+_COMPILED_TEXT_COMMAND_PATTERNS = _compile(
+    (
+        r"\b(?:rm|del|format)\s+(?:-rf\s+)?[a-z]:?[/\\]",
+        r"\b(?:curl|wget|Invoke-WebRequest|iwr)\s+https?://",
+        r"\b(?:powershell|pwsh|cmd|bash|sh|python|python3)\s+(?:-|/c|/k|--)",
+        r"\b(?:sudo|su|doas)\s+\w+",
+        r"\b(?:eval|exec)\s*\(",
+        r"/bin/\w+\s+-",
+    )
+)
 
 
 def _redact_sensitive_string(text: str, fields: tuple[str, ...] | None = None) -> str:
@@ -173,8 +183,17 @@ def check_tool_request_with_tool(
     return check_tool_request(arguments)
 
 
-def _matches_abuse(value: str) -> bool:
+def _matches_abuse(value: str, *, strict_punctuation: bool = True) -> bool:
     for pattern in _COMPILED_COMMAND_PATTERNS:
+        if not strict_punctuation and pattern.pattern in {r"\$\(", r"&&", r"\|\|", r";", r"`"}:
+            continue
+        if pattern.search(value):
+            return True
+    return False
+
+
+def _matches_text_command_abuse(value: str) -> bool:
+    for pattern in _COMPILED_TEXT_COMMAND_PATTERNS:
         if pattern.search(value):
             return True
     return False
@@ -199,7 +218,7 @@ def check_input_text(text: str) -> GuardDecision:
     for pattern in _COMPILED_INPUT_PATTERNS:
         if pattern.search(lowered):
             return GuardDecision(False, reason=f"blocked_input_pattern:{pattern.pattern}")
-    if _matches_abuse(lowered):
+    if _matches_text_command_abuse(lowered):
         return GuardDecision(False, reason="blocked_input_pattern:command_abuse")
     return GuardDecision(True, None)
 
@@ -227,10 +246,8 @@ def redact_sensitive_args(text: Any, fields: list[str] | None = None) -> Any:
 
 def check_output_text(text: str) -> GuardDecision:
     lowered = sanitize_text(text).lower()
-    if _matches_abuse(lowered):
+    if _matches_text_command_abuse(lowered):
         return GuardDecision(False, reason="unsafe_output_detected")
     if "i cannot" in lowered and "assist" in lowered:
         return GuardDecision(True, None)
-    if "unsafe" in lowered:
-        return GuardDecision(False, reason="unsafe_output_detected")
     return GuardDecision(True, None)
