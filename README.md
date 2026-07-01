@@ -30,6 +30,23 @@ Recommended rollout controls:
 - `HARNESS_ENABLE_ADVANCED_ROUTER=0|1`
 - `HARNESS_TOOL_SANDBOX=off|docker`
 
+## Multi-device execution (one LLM per processor type + hybrid)
+
+The production runtime can drive several model backends at once — one per processor type — and pick a device per request:
+
+- `backends:` (list) in the config defines one OpenAI-compatible endpoint per device. Reference loadouts:
+  - `harness-multi-device.yaml` — `qwen3:4b` on NPU (`:11433`), GPU (`:11434`), CPU (`:11435`)
+  - `harness-qwen-hybrid-live.yaml` — `qwen2.5-7b-instruct` on NPU/GPU/CPU plus a hybrid NPU+iGPU backend served by AMD Lemonade Ryzen AI (`:13305`, `runtime: lemonade_ryzenai`)
+  - `harness-multi-device-docker.yaml` + `docker-compose.multi-device.yaml` — containerized variant
+- Execution profiles: `npu_only`, `gpu`, `cpu`, `hybrid_npu_igpu`, `agentic_parallel`. Resolution precedence: request `execution_profile` → route manifest metadata → `route_backend_defaults.prefer_device` → built-in heuristics.
+- `route_backend_defaults` maps each route to a preferred device, fallback chain, and latency class.
+- `agentic_parallel` fans the prompt out to NPU/GPU/hybrid workers concurrently and synthesizes the final answer on the CPU controller (`agentic_parallel_enabled`, `agentic_parallel_max_workers`, `agentic_parallel_max_wall_clock_seconds`).
+- Responses report `meta.provider.execution`: selected backend/device, profile and its source, the ordered backend plan, and tokens/sec.
+- Model/device compatibility catalog: `compat-hybrid-test.json`.
+- Smoke and benchmark tooling: `scripts/Smoke-MultiDeviceHarness.ps1`, `scripts/Smoke-MultiDeviceHarnessPhase2.ps1`, `scripts/Benchmark-MultiDeviceHarness.ps1`, `scripts/Benchmark-FullCoverageLoadout.ps1`, `scripts/Invoke-HarnessFullPromptBenchmark.ps1`. Measured per-device baseline: `temp.md`.
+
+Known gap: `fallback_chain` currently orders the backend plan only — if the selected backend fails mid-request, the runtime does not yet retry the next device automatically.
+
 ### Quick commands
 
 - Demo run:
