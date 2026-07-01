@@ -367,11 +367,11 @@ Feature-flag defaults:
 
 ## Part-specific documentation
 
-- [readme.me](/readme.me) — project-level part index and roadmap.
+- [docs/parts-index.md](/docs/parts-index.md) — project-level part index and roadmap.
 - [docs/core-pipeline-and-policy-control.md](/docs/core-pipeline-and-policy-control.md)
 - [docs/local-model-backend-abstraction.md](/docs/local-model-backend-abstraction.md)
 - [docs/tooling-validation-safety-traces.md](/docs/tooling-validation-safety-traces.md)
 - [docs/api-surface-and-launch.md](/docs/api-surface-and-launch.md)
-- [harness/readme.me](/harness/readme.me) — legacy component index.
-- [harness/adapters/readme.me](/harness/adapters/readme.me) — legacy adapter index.
-- [deployment/readme.me](/deployment/readme.me) — container and deployment runbook.
+- [harness/README.md](/harness/README.md) — legacy component index.
+- [harness/adapters/README.md](/harness/adapters/README.md) — legacy adapter index.
+- [deployment/README.md](/deployment/README.md) — container and deployment runbook.

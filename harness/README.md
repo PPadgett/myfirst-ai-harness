@@ -102,6 +102,6 @@ Implementation guidance
 Related docs
 ------------
 
-- [harness/adapters/readme.me](/harness/adapters/readme.me)
-- [deployment/readme.me](/deployment/readme.me)
+- [harness/adapters/README.md](/harness/adapters/README.md)
+- [deployment/README.md](/deployment/README.md)
 - [README.md](/README.md)

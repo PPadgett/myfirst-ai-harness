@@ -16,9 +16,9 @@ Step-level docs (new):
 
 If you want clear part-by-part ownership, read:
 
-- [harness/readme.me](/harness/readme.me)
-- [harness/adapters/readme.me](/harness/adapters/readme.me)
-- [deployment/readme.me](/deployment/readme.me)
+- [harness/README.md](/harness/README.md)
+- [harness/adapters/README.md](/harness/adapters/README.md)
+- [deployment/README.md](/deployment/README.md)
 
 Core path overview
 ------------------
@@ -90,7 +90,7 @@ Cutting-edge upgrade checklist (next capabilities to add)
 Windows 11 note
 ---------------
 
-The deployment docs in [deployment/readme.me](/deployment/readme.me) include PowerShell commands for:
+The deployment docs in [deployment/README.md](/deployment/README.md) include PowerShell commands for:
 - NVIDIA NIM profile
 - Ollama profile
 - health/readiness workflows
