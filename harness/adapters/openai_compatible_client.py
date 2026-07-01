@@ -42,13 +42,10 @@ class OpenAICompatibleClient(BaseModelClient):
         if req.response_schema is not None:
             # Keep a broad compatibility path: most local providers honor JSON mode for schema-constrained flows.
             payload["response_format"] = {"type": "json_object"}
-        if req.allow_reasoning:
-            # Optional extra body for runtimes that expose reasoning budgets.
-            payload["extra_body"] = {
-                "reasoning": {"enabled": True},
-            }
-            if req.reasoning_budget_tokens is not None:
-                payload["extra_body"]["reasoning"]["max_tokens"] = req.reasoning_budget_tokens
+        # Do not emit the Python SDK-only "extra_body" wrapper in raw HTTP
+        # requests. Local OpenAI-compatible providers and Lemonade commonly
+        # reject unknown top-level fields. Provider-specific request fields can
+        # still be supplied through configured backend.extra_body below.
         if req.extra:
             payload.update(req.extra)
         if self.extra_body:
@@ -68,13 +65,35 @@ class OpenAICompatibleClient(BaseModelClient):
         except httpx.HTTPStatusError as exc:
             response = exc.response
             status_code = response.status_code if response is not None else "unknown"
-            raise RuntimeError(f"model_request_failed: backend returned status {status_code}") from exc
+            detail = ""
+            if response is not None:
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        error = payload.get("error")
+                        if isinstance(error, dict):
+                            detail = str(error.get("message") or error.get("code") or "")
+                        elif error:
+                            detail = str(error)
+                except ValueError:
+                    detail = response.text.strip()
+            detail_text = f": {detail}" if detail else ""
+            raise RuntimeError(f"model_request_failed: backend returned status {status_code}{detail_text}") from exc
 
         choice = data.get("choices", [{}])[0]
         msg = choice.get("message", {})
         text = msg.get("content", "")
         reasoning = self._extract_reasoning(msg)
         usage = data.get("usage", {})
+        provider = data.get("provider")
+        if not isinstance(provider, dict):
+            provider = {}
+        provider.setdefault("configured_backend", "openai_compatible")
+        provider.setdefault("generation_backend", "openai_compatible")
+        provider.setdefault("model", req.model or self.model)
+        provider.setdefault("finish_reason", choice.get("finish_reason"))
+        data["provider"] = provider
+
         return ModelGenerateResult(
             text=text,
             reasoning=reasoning,

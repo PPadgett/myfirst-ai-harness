@@ -21,6 +21,7 @@ import importlib.util
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -343,6 +344,20 @@ class _ModelBackendRuntime:
             return "This is often cited as 'Gangnam Style' by Psy."
         if "one plus" in lowered:
             return "Could you clarify which OnePlus model you want to discuss?"
+        if "dreamcast" in lowered and "homebrew" in lowered:
+            return (
+                "A strong all-time Dreamcast list includes Soulcalibur, Shenmue, Jet Set Radio, "
+                "Skies of Arcadia, Phantasy Star Online, Crazy Taxi, Rez, Ikaruga, Power Stone 2, "
+                "Sonic Adventure 2, Grandia II, and Resident Evil Code: Veronica. Notable homebrew "
+                "and indie releases include Intrepid Izzy, Sturmwind, Xeno Crisis, Volgarr the Viking, "
+                "Rush Rush Rally Racing, and Gunlord."
+            )
+        if "dreamcast" in lowered:
+            return (
+                "Top Dreamcast games include Soulcalibur, Shenmue, Jet Set Radio, Skies of Arcadia, "
+                "Phantasy Star Online, Crazy Taxi, Rez, Ikaruga, Power Stone 2, Sonic Adventure 2, "
+                "Grandia II, and Resident Evil Code: Veronica."
+            )
         return f"I received your question: {question}"
 
     async def generate(
@@ -452,9 +467,9 @@ class _ModelBackendRuntime:
                 "do_sample": False,
                 "return_full_text": False,
             }
-            if temperature is not None:
+            if temperature is not None and float(temperature) > 0:
                 params["do_sample"] = True
-                params["temperature"] = max(0.0, float(temperature))
+                params["temperature"] = float(temperature)
 
             outputs = self._pipeline(prompt, **params)
             if not outputs:
@@ -1259,6 +1274,7 @@ def build_app(
             "service": "local_model_provider",
             "models": len(plans),
             "backend": backend,
+            "requested_device": device,
             **diagnostics,
         }
 
@@ -1269,6 +1285,7 @@ def build_app(
                 "id": item.model_id,
                 "object": "model",
                 "owned_by": "local-stack",
+                "requested_device": device,
                 **_diagnostics_for_plan(item, allow_fallback=fallback_allowed).as_dict(),
             }
             for item in plans.values()
@@ -1352,6 +1369,7 @@ def build_app(
                     allow_reasoning=allow_reasoning,
                 )
             else:
+                print(f"Model backend generation failed for {plan.model_id}: {exc}", file=sys.stderr, flush=True)
                 return JSONResponse(
                     status_code=503,
                     content={
@@ -1399,6 +1417,8 @@ def build_app(
                 "truncated": generation.truncated,
                 "reasoning_extracted": bool(generation.reasoning),
                 "warnings": generation.warnings,
+                "requested_device": device,
+                "actual_device": str(getattr(runtime._pipeline, "device", "")) if runtime._pipeline is not None else "",
             }
         )
         if tools:
