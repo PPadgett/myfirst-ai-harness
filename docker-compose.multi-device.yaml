@@ -1,0 +1,208 @@
+services:
+  asus-npu-backend:
+    profiles:
+      - multi-device
+    image: ${NPU_BACKEND_IMAGE:-harness-multi-device-backend}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: asus-npu-backend
+    ports:
+      - "11433:11433"
+    volumes:
+      - ${NPU_MODELS_DIR:-./.models/npu}:/workspace/npu-models:ro
+      - ./.cache:/workspace/.cache
+    command:
+      - "python"
+      - "-m"
+      - "harness.local_model_provider"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "11433"
+      - "--model"
+      - "${NPU_MODEL}"
+      - "--backend"
+      - "${NPU_BACKEND_RUNTIME}"
+      - "--model-path"
+      - "${NPU_MODEL_PATH}"
+      - "--models-root"
+      - "${NPU_MODELS_ROOT}"
+      - "--device"
+      - "${NPU_DEVICE}"
+      - "--max-new-tokens"
+      - "${NPU_MAX_NEW_TOKENS}"
+      - "--llama-cpp-n-gpu-layers"
+      - "${NPU_LLAMACPP_GPU_LAYERS}"
+      - "--llama-cpp-n-ctx"
+      - "${NPU_LLAMACPP_CTX}"
+      - "--llama-cpp-n-threads"
+      - "${NPU_LLAMACPP_THREADS:-4}"
+      - "--allow-fallback"
+      - "--local-only"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "if command -v curl >/dev/null 2>&1; then curl -sf http://localhost:11433/v1/models >/dev/null; elif command -v wget >/dev/null 2>&1; then wget -qO- http://localhost:11433/v1/models >/dev/null; else exit 1; fi",
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 12
+      start_period: 25s
+    restart: unless-stopped
+
+  asus-gpu-backend:
+    profiles:
+      - multi-device
+    image: ${GPU_BACKEND_IMAGE:-harness-multi-device-backend}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: asus-gpu-backend
+    ports:
+      - "11434:11434"
+    volumes:
+      - ${GPU_MODELS_DIR:-./.models/gpu}:/workspace/gpu-models:ro
+      - ./.cache:/workspace/.cache
+    command:
+      - "python"
+      - "-m"
+      - "harness.local_model_provider"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "11434"
+      - "--model"
+      - "${GPU_MODEL}"
+      - "--backend"
+      - "${GPU_BACKEND_RUNTIME}"
+      - "--model-path"
+      - "${GPU_MODEL_PATH}"
+      - "--models-root"
+      - "${GPU_MODELS_ROOT}"
+      - "--device"
+      - "${GPU_DEVICE}"
+      - "--max-new-tokens"
+      - "${GPU_MAX_NEW_TOKENS}"
+      - "--llama-cpp-n-gpu-layers"
+      - "${GPU_LLAMACPP_GPU_LAYERS}"
+      - "--llama-cpp-n-ctx"
+      - "${GPU_LLAMACPP_CTX}"
+      - "--llama-cpp-n-threads"
+      - "${GPU_LLAMACPP_THREADS:-4}"
+      - "--allow-fallback"
+      - "--local-only"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "if command -v curl >/dev/null 2>&1; then curl -sf http://localhost:11434/v1/models >/dev/null; elif command -v wget >/dev/null 2>&1; then wget -qO- http://localhost:11434/v1/models >/dev/null; else exit 1; fi",
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 12
+      start_period: 25s
+    restart: unless-stopped
+
+  asus-cpu-backend:
+    profiles:
+      - multi-device
+    image: ${CPU_BACKEND_IMAGE:-harness-multi-device-backend}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: asus-cpu-backend
+    ports:
+      - "11435:11435"
+    volumes:
+      - ${CPU_MODELS_DIR:-./.models/cpu}:/workspace/cpu-models:ro
+      - ./.cache:/workspace/.cache
+    command:
+      - "python"
+      - "-m"
+      - "harness.local_model_provider"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "11435"
+      - "--model"
+      - "${CPU_MODEL}"
+      - "--backend"
+      - "${CPU_BACKEND_RUNTIME}"
+      - "--model-path"
+      - "${CPU_MODEL_PATH}"
+      - "--models-root"
+      - "${CPU_MODELS_ROOT}"
+      - "--device"
+      - "${CPU_DEVICE}"
+      - "--max-new-tokens"
+      - "${CPU_MAX_NEW_TOKENS}"
+      - "--llama-cpp-n-gpu-layers"
+      - "${CPU_LLAMACPP_GPU_LAYERS}"
+      - "--llama-cpp-n-ctx"
+      - "${CPU_LLAMACPP_CTX}"
+      - "--llama-cpp-n-threads"
+      - "${CPU_LLAMACPP_THREADS:-4}"
+      - "--allow-fallback"
+      - "--local-only"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "if command -v curl >/dev/null 2>&1; then curl -sf http://localhost:11435/v1/models >/dev/null; elif command -v wget >/dev/null 2>&1; then wget -qO- http://localhost:11435/v1/models >/dev/null; else exit 1; fi",
+        ]
+      interval: 20s
+      timeout: 10s
+      retries: 12
+      start_period: 25s
+    restart: unless-stopped
+
+  harness-multidevice:
+    profiles:
+      - multi-device
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: harness-multidevice
+    depends_on:
+      asus-npu-backend:
+        condition: service_healthy
+        required: false
+      asus-gpu-backend:
+        condition: service_healthy
+        required: false
+      asus-cpu-backend:
+        condition: service_healthy
+        required: false
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./:/app:ro
+      - ./.cache:/app/.cache
+      - ./traces:/app/traces
+      - ./corpus:/app/corpus:ro
+      - ${MULTI_DEVICE_CONFIG:-./harness-multi-device-docker.yaml}:/app/harness.yaml:ro
+    environment:
+      HARNESS_CONFIG: /app/harness.yaml
+      HARNESS_BACKEND: ${HARNESS_BACKEND:-openai}
+      HARNESS_BACKEND_BASE_URL: ${HARNESS_BACKEND_BASE_URL:-}
+      HARNESS_MODEL: ${HARNESS_MODEL:-local-foundation:v1}
+      HARNESS_CACHE_DIR: /app/.cache
+      HARNESS_TRACE_DIR: /app/traces
+      HARNESS_CORPUS: /app/corpus
+      HARNESS_FEATURE_LEVEL: ${HARNESS_FEATURE_LEVEL:-basic}
+      HARNESS_ROUTE_MANIFEST: ${HARNESS_ROUTE_MANIFEST:-real_harness_routes.yaml}
+      HARNESS_REQUIRE_EVIDENCE: ${HARNESS_REQUIRE_EVIDENCE:-false}
+    command: ["harnessd", "--host", "0.0.0.0", "--port", "8080", "--config", "/app/harness.yaml"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()\"",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped

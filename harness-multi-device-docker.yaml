@@ -1,0 +1,104 @@
+backends:
+  - id: npu
+    name: openai
+    base_url: "http://asus-npu-backend:11433/v1"
+    model: "local-foundation:npu"
+    api_key: null
+    timeout_seconds: 120
+    max_tokens: 768
+    capabilities: ["npu", "hybrid"]
+    device: npu
+    max_context: 4096
+    max_output_tokens: 768
+    max_concurrency: 1
+    health_endpoint: "http://asus-npu-backend:11433/v1/health"
+  - id: gpu
+    name: openai
+    base_url: "http://asus-gpu-backend:11434/v1"
+    model: "local-foundation:gpu"
+    api_key: null
+    timeout_seconds: 120
+    max_tokens: 1536
+    capabilities: ["gpu", "hybrid"]
+    device: gpu
+    max_context: 8192
+    max_output_tokens: 1024
+    max_concurrency: 2
+    health_endpoint: "http://asus-gpu-backend:11434/v1/health"
+  - id: cpu
+    name: openai
+    base_url: "http://asus-cpu-backend:11435/v1"
+    model: "local-foundation:v1"
+    api_key: null
+    timeout_seconds: 120
+    max_tokens: 1024
+    capabilities: ["cpu"]
+    device: cpu
+    max_context: 4096
+    max_output_tokens: 1024
+    max_concurrency: 4
+    health_endpoint: "http://asus-cpu-backend:11435/v1/health"
+
+model: "local-foundation:v1"
+corpus_dir: "corpus"
+trace_dir: "traces"
+cache_dir: ".cache"
+enable_cache: true
+max_cache_entries: 4000
+
+route_backend_defaults:
+  direct:
+    prefer_device: npu
+    fallback_chain:
+      - npu
+      - gpu
+      - cpu
+    latency_class: interactive
+    max_output_tokens: 512
+    max_context: 2048
+  grounded_qa:
+    prefer_device: gpu
+    fallback_chain:
+      - gpu
+      - npu
+      - cpu
+    latency_class: balanced
+    max_context: 4096
+  structured_extraction:
+    prefer_device: gpu
+    fallback_chain:
+      - gpu
+      - cpu
+    latency_class: batch-heavy
+    max_context: 4096
+  tool_required:
+    prefer_device: cpu
+    fallback_chain:
+      - cpu
+      - gpu
+    latency_class: batch-heavy
+    max_output_tokens: 1024
+  code_or_data:
+    prefer_device: gpu
+    fallback_chain:
+      - gpu
+      - cpu
+    latency_class: balanced
+  side_effecting_action:
+    prefer_device: cpu
+    fallback_chain:
+      - cpu
+      - gpu
+    latency_class: batch-heavy
+    max_output_tokens: 768
+  high_risk:
+    prefer_device: cpu
+    fallback_chain:
+      - cpu
+      - gpu
+    latency_class: batch-heavy
+    max_output_tokens: 1024
+
+route_manifest_path: "real_harness_routes.yaml"
+feature_level: "basic"
+require_evidence: false

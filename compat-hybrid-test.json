@@ -1,0 +1,14 @@
+{
+    "models":  [
+                   {
+                       "supports":  [
+                                        "cpu",
+                                        "gpu",
+                                        "npu",
+                                        "hybrid"
+                                    ],
+                       "family":  "qwen",
+                       "model_id":  "qwen3:4b"
+                   }
+               ]
+}

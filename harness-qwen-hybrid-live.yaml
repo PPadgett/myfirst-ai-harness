@@ -1,0 +1,137 @@
+backends:
+  - id: npu
+    name: openai
+    base_url: "http://127.0.0.1:11433/v1"
+    model: "qwen2.5-7b-instruct"
+    api_key: null
+    timeout_seconds: 180
+    max_tokens: 768
+    required: true
+    capabilities: ["npu", "qwen", "reasoning"]
+    device: npu
+    device_mode: npu
+    runtime: local_provider
+    model_family: qwen
+    max_context: 4096
+    max_output_tokens: 768
+    max_concurrency: 1
+    health_endpoint: "http://127.0.0.1:11433/health"
+  - id: gpu
+    name: openai
+    base_url: "http://127.0.0.1:11434/v1"
+    model: "qwen2.5-7b-instruct"
+    api_key: null
+    timeout_seconds: 180
+    max_tokens: 1024
+    required: true
+    capabilities: ["gpu", "qwen", "reasoning"]
+    device: gpu
+    device_mode: gpu
+    runtime: local_provider
+    model_family: qwen
+    max_context: 4096
+    max_output_tokens: 1024
+    max_concurrency: 2
+    health_endpoint: "http://127.0.0.1:11434/health"
+  - id: cpu
+    name: openai
+    base_url: "http://127.0.0.1:11435/v1"
+    model: "qwen2.5-7b-instruct"
+    api_key: null
+    timeout_seconds: 180
+    max_tokens: 1024
+    required: true
+    capabilities: ["cpu", "qwen", "reasoning"]
+    device: cpu
+    device_mode: cpu
+    runtime: local_provider
+    model_family: qwen
+    max_context: 2048
+    max_output_tokens: 1024
+    max_concurrency: 4
+    health_endpoint: "http://127.0.0.1:11435/health"
+  - id: hybrid
+    name: openai
+    base_url: "http://127.0.0.1:13305/api/v1"
+    model: "amd/Qwen2.5-7B-Instruct_rai_1.7.1_hybrid"
+    api_key: null
+    timeout_seconds: 300
+    max_tokens: 1024
+    required: true
+    capabilities: ["hybrid", "npu", "igpu", "gpu", "qwen", "reasoning"]
+    device: hybrid
+    device_mode: hybrid_npu_igpu
+    runtime: lemonade_ryzenai
+    model_family: qwen
+    max_context: 4096
+    max_output_tokens: 1024
+    max_concurrency: 1
+    health_endpoint: "http://127.0.0.1:13305/api/v1/health"
+
+model: ""
+corpus_dir: "corpus"
+trace_dir: "traces"
+cache_dir: ".cache"
+enable_cache: true
+max_cache_entries: 2000
+
+route_backend_defaults:
+  direct:
+    prefer_device: npu
+    fallback_chain:
+      - npu
+      - gpu
+      - hybrid
+      - cpu
+    latency_class: interactive
+    max_output_tokens: 512
+  grounded_qa:
+    prefer_device: hybrid
+    fallback_chain:
+      - hybrid
+      - gpu
+      - npu
+      - cpu
+    latency_class: balanced
+    max_context: 4096
+  structured_extraction:
+    prefer_device: gpu
+    fallback_chain:
+      - gpu
+      - hybrid
+      - npu
+      - cpu
+    latency_class: batch-heavy
+    max_context: 4096
+  tool_required:
+    prefer_device: cpu
+    fallback_chain:
+      - cpu
+      - gpu
+      - npu
+      - hybrid
+    latency_class: batch-heavy
+    max_output_tokens: 1024
+  code_or_data:
+    prefer_device: gpu
+    fallback_chain:
+      - gpu
+      - hybrid
+      - cpu
+    latency_class: balanced
+  side_effecting_action:
+    prefer_device: cpu
+    latency_class: batch-heavy
+    max_output_tokens: 512
+  high_risk:
+    prefer_device: cpu
+    latency_class: batch-heavy
+    max_output_tokens: 1024
+
+route_manifest_path: "real_harness_routes.yaml"
+feature_level: "basic"
+require_evidence: false
+agentic_parallel_enabled: true
+agentic_parallel_max_workers: 2
+agentic_parallel_max_repair_loops: 1
+agentic_parallel_max_wall_clock_seconds: 120
