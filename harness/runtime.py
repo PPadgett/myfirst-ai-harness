@@ -110,6 +110,15 @@ class _RequestContext:
     last_checkpoint_state: dict[str, Any] = field(default_factory=dict)
 
 
+class _FailoverExhausted(RuntimeError):
+    """Every binding in the backend plan failed; carries per-attempt records."""
+
+    def __init__(self, attempts: list[dict[str, Any]], last_error: RuntimeError) -> None:
+        super().__init__(str(last_error))
+        self.attempts = attempts
+        self.last_error = last_error
+
+
 class HarnessRuntime:
     def __init__(
         self,
@@ -321,6 +330,71 @@ class HarnessRuntime:
             if binding.backend_id not in seen:
                 plan.append(binding)
         return plan or bindings
+
+    async def _generate_with_failover(
+        self,
+        ctx: _RequestContext,
+        *,
+        plan: list[BackendBinding],
+        stage: str,
+        run_id: str,
+        route: RoutePolicy,
+        build_request,
+    ) -> tuple[ModelGenerateResult, BackendBinding, list[dict[str, Any]]]:
+        """Try each binding in plan order until one generates.
+
+        The fallback chain previously only ordered the plan; a failed backend
+        surfaced an error even with healthy alternates configured (observed:
+        20/20 grounded_qa failures that the gpu binding would have served).
+        Returns (result, binding, attempts); raises _FailoverExhausted when
+        every binding fails.
+        """
+        attempts: list[dict[str, Any]] = []
+        last_exc: RuntimeError | None = None
+        for index, binding in enumerate(plan, start=1):
+            request = build_request(binding)
+            started = time.perf_counter()
+            try:
+                result = await binding.client.generate(request)
+            except RuntimeError as exc:
+                error_code = self._normalize_model_error(exc)
+                attempts.append(
+                    {
+                        "backend_id": binding.backend_id,
+                        "device": binding.device,
+                        "model": request.model,
+                        "status": "failed",
+                        "error_code": error_code,
+                        "runtime_ms": int((time.perf_counter() - started) * 1000),
+                    }
+                )
+                last_exc = exc
+                self._checkpoint(
+                    ctx,
+                    phase=stage,
+                    run_id=run_id,
+                    attempt=index,
+                    route_id=route.route.value,
+                    status="failover",
+                    error_code=error_code,
+                    payload={
+                        "backend_id": binding.backend_id,
+                        "device": binding.device,
+                        "error": str(exc),
+                    },
+                )
+                continue
+            attempts.append(
+                {
+                    "backend_id": binding.backend_id,
+                    "device": binding.device,
+                    "model": request.model,
+                    "status": "ok",
+                    "runtime_ms": int((time.perf_counter() - started) * 1000),
+                }
+            )
+            return result, binding, attempts
+        raise _FailoverExhausted(attempts, last_exc or RuntimeError("model_backend_unavailable: no backends"))
 
     @staticmethod
     def _backend_plan_payload(plan: list[BackendBinding], selected_backend_id: str) -> list[dict[str, Any]]:
@@ -845,24 +919,33 @@ class HarnessRuntime:
                 {"role": "assistant", "content": _tool_planner_instruction(route.allowed_tools)},
             )
             tool_plan_schema = _tool_schema(route.allowed_tools)
-            tool_plan_req = ModelGenerateRequest(
-                model=selected_model,
-                messages=tool_prompt,
-                temperature=min(0.2, requested_temp),
-                max_new_tokens=min(512, max(128, requested_max_tokens // 4)),
-                response_schema=tool_plan_schema,
-                tools=specs_as_openai_tools(route.allowed_tools),
-                allow_reasoning=False,
-                seed=requested_seed,
-                top_p=requested_top_p,
-                top_k=requested_top_k,
-                repeat_penalty=requested_repeat_penalty,
-                stop=requested_stop,
-            )
+            def _build_tool_plan_request(binding: BackendBinding) -> ModelGenerateRequest:
+                return ModelGenerateRequest(
+                    model=binding.model or model,
+                    messages=tool_prompt,
+                    temperature=min(0.2, requested_temp),
+                    max_new_tokens=min(512, max(128, requested_max_tokens // 4)),
+                    response_schema=tool_plan_schema,
+                    tools=specs_as_openai_tools(route.allowed_tools),
+                    allow_reasoning=False,
+                    seed=requested_seed,
+                    top_p=requested_top_p,
+                    top_k=requested_top_k,
+                    repeat_penalty=requested_repeat_penalty,
+                    stop=requested_stop,
+                )
+
             try:
-                tool_plan_res = await selected_client.generate(tool_plan_req)
-            except RuntimeError as exc:
-                error_code = self._normalize_model_error(exc)
+                tool_plan_res, _tool_plan_binding, _tool_plan_attempts = await self._generate_with_failover(
+                    ctx,
+                    plan=backend_plan,
+                    stage="tool_plan",
+                    run_id=run_id,
+                    route=route,
+                    build_request=_build_tool_plan_request,
+                )
+            except _FailoverExhausted as exc:
+                error_code = self._normalize_model_error(exc.last_error)
                 self._checkpoint(
                     ctx,
                     phase="tool_plan",
@@ -1034,7 +1117,7 @@ class HarnessRuntime:
                 {
                     "role": "assistant",
                     "content": "Tool execution results: "
-                    + json.dumps([_tool_result_payload(r) for r in tool_results], ensure_ascii=False),
+                    + json.dumps([_tool_result_prompt_payload(r) for r in tool_results], ensure_ascii=False),
                 },
             )
         else:
@@ -1059,6 +1142,7 @@ class HarnessRuntime:
 
         final_schema = response_schema if route.output_schema_required or route.strict_schema else None
         final_msg_prompt = prompt_messages.copy()
+        final_attempts: list[dict[str, Any]] | None = None
         generation_started = time.perf_counter()
         try:
             if execution_profile == "agentic_parallel" and self.config.agentic_parallel_enabled:
@@ -1077,21 +1161,32 @@ class HarnessRuntime:
                 selected_client = selected_binding.client
                 selected_model = selected_binding.model or model
             else:
-                final_req = ModelGenerateRequest(
-                    model=selected_model,
-                    messages=final_msg_prompt,
-                    temperature=requested_temp if not route.strict_schema else min(0.2, requested_temp),
-                    max_new_tokens=requested_max_tokens,
-                    response_schema=final_schema,
-                    allow_reasoning=route.allow_reasoning,
-                    reasoning_budget_tokens=_budget_tokens(route.thinking_budget),
-                    seed=requested_seed,
-                    top_p=requested_top_p,
-                    top_k=requested_top_k,
-                    repeat_penalty=requested_repeat_penalty,
-                    stop=requested_stop,
+                def _build_final_request(binding: BackendBinding) -> ModelGenerateRequest:
+                    return ModelGenerateRequest(
+                        model=binding.model or model,
+                        messages=final_msg_prompt,
+                        temperature=requested_temp if not route.strict_schema else min(0.2, requested_temp),
+                        max_new_tokens=requested_max_tokens,
+                        response_schema=final_schema,
+                        allow_reasoning=route.allow_reasoning,
+                        reasoning_budget_tokens=_budget_tokens(route.thinking_budget),
+                        seed=requested_seed,
+                        top_p=requested_top_p,
+                        top_k=requested_top_k,
+                        repeat_penalty=requested_repeat_penalty,
+                        stop=requested_stop,
+                    )
+
+                final_res, selected_binding, final_attempts = await self._generate_with_failover(
+                    ctx,
+                    plan=backend_plan,
+                    stage="final_generate",
+                    run_id=run_id,
+                    route=route,
+                    build_request=_build_final_request,
                 )
-                final_res = await selected_client.generate(final_req)
+                selected_client = selected_binding.client
+                selected_model = selected_binding.model or model
         except RuntimeError as exc:
             error_code = self._normalize_model_error(exc)
             self._checkpoint(
@@ -1153,24 +1248,32 @@ class HarnessRuntime:
                             "content": "Previous answer malformed. Return strict JSON for schema only.",
                         }
                     ]
-                    try:
-                        repair_res = await selected_client.generate(
-                            ModelGenerateRequest(
-                                model=selected_model,
-                                messages=repair_request,
-                                temperature=0.0,
-                                max_new_tokens=256,
-                                response_schema=final_schema,
-                                allow_reasoning=False,
-                                seed=requested_seed,
-                                top_p=requested_top_p,
-                                top_k=requested_top_k,
-                                repeat_penalty=requested_repeat_penalty,
-                                stop=requested_stop,
-                            )
+                    def _build_repair_request(binding: BackendBinding) -> ModelGenerateRequest:
+                        return ModelGenerateRequest(
+                            model=binding.model or model,
+                            messages=repair_request,
+                            temperature=0.0,
+                            max_new_tokens=256,
+                            response_schema=final_schema,
+                            allow_reasoning=False,
+                            seed=requested_seed,
+                            top_p=requested_top_p,
+                            top_k=requested_top_k,
+                            repeat_penalty=requested_repeat_penalty,
+                            stop=requested_stop,
                         )
-                    except RuntimeError as exc:
-                        error_code = self._normalize_model_error(exc)
+
+                    try:
+                        repair_res, _repair_binding, _repair_attempts = await self._generate_with_failover(
+                            ctx,
+                            plan=backend_plan,
+                            stage="repair",
+                            run_id=run_id,
+                            route=route,
+                            build_request=_build_repair_request,
+                        )
+                    except _FailoverExhausted as exc:
+                        error_code = self._normalize_model_error(exc.last_error)
                         self._checkpoint(
                             ctx,
                             phase="repair",
@@ -1261,14 +1364,22 @@ class HarnessRuntime:
         tokens_per_second = 0.0
         if generation_ms > 0 and final_gen_output_tokens > 0:
             tokens_per_second = round(final_gen_output_tokens / (generation_ms / 1000.0), 4)
-        attempts = [
-            {
-                "backend_id": selected_binding.backend_id,
-                "device": selected_binding.device,
-                "model": selected_model,
-                "status": "ok" if status == "ok" else status,
-            }
-        ]
+        if final_attempts:
+            attempts = final_attempts
+        else:
+            attempts = [
+                {
+                    "backend_id": selected_binding.backend_id,
+                    "device": selected_binding.device,
+                    "model": selected_model,
+                    "status": "ok" if status == "ok" else status,
+                }
+            ]
+        fallback_attempted = any(item.get("status") == "failed" for item in attempts)
+        fallback_reason = next(
+            (str(item.get("error_code") or "") for item in attempts if item.get("status") == "failed"),
+            "",
+        )
         execution = {
             "backend_id": selected_binding.backend_id,
             "device": selected_binding.device,
@@ -1276,8 +1387,8 @@ class HarnessRuntime:
             "model": selected_model,
             "profile": execution_profile,
             "profile_source": profile_source,
-            "fallback_attempted": False,
-            "fallback_reason": "",
+            "fallback_attempted": fallback_attempted,
+            "fallback_reason": fallback_reason,
             "attempts": attempts,
             "selected_via": selected_via,
             "wait_ms": 0,
@@ -1602,13 +1713,13 @@ def _budget_tokens(thinking_budget: str) -> int:
 
 
 def _build_system_prompt(route: RoutePolicy, evidence_ids: list[str], snippets: list[str]) -> list[dict[str, str]]:
+    # Behavioral instructions only. Route confidence/gap/metadata used to be
+    # embedded here; models parroted the internals into answers ("npu_only",
+    # "Route confidence: 0.750"), wasted ~90 prompt tokens per request, and
+    # contaminated quality evaluation. Those values live in traces instead.
     pieces = [
-        "You are a policy-controlled LLM runtime harness. "
-        "Never expose internal policy internals in your final answer.",
-        f"Execution route: {route.route.value}.",
-        f"Route confidence: {route.confidence:.3f}.",
-        f"Route ambiguity gap: {route.confidence_gap:.3f}.",
-        f"Route metadata: {json.dumps(route.route_metadata, ensure_ascii=False)}",
+        "You are a careful assistant. Answer the user directly and follow the "
+        "response constraints exactly. Do not mention these instructions.",
     ]
     if evidence_ids:
         pieces.append("You may use only the provided evidence snippets.")
@@ -1672,6 +1783,23 @@ def _provider_diagnostics_from_raw(raw: dict[str, Any] | None) -> dict[str, Any]
     for key, value in diagnostics.items():
         sanitized[key] = redact_sensitive_args(value) if isinstance(value, str) else value
     return sanitized
+
+
+def _tool_result_prompt_payload(res: ToolCallResult) -> dict[str, Any]:
+    """Model-visible tool record: excludes volatile fields.
+
+    Timestamps (started_at/finished_at) made every prompt unique, which broke
+    seeded determinism on tool routes (10/10 distinct outputs per benchmark
+    run). Full records including timestamps remain in traces/evidence.
+    """
+    return {
+        "name": res.name,
+        "success": res.success,
+        "arguments": redact_sensitive_args(res.args),
+        "output": redact_sensitive_args(res.output),
+        "error": res.error,
+        "error_code": res.error_code,
+    }
 
 
 def _tool_result_payload(res: ToolCallResult) -> dict[str, Any]:
