@@ -5,6 +5,24 @@ Purpose: every generation parameter that affects the CPU / GPU / NPU / Hybrid co
 
 ---
 
+## 0. Fix status (2026-07-01)
+
+Issues §7.1–§7.9 were addressed on this branch after the audit:
+
+| # | Issue | Fix |
+|---|---|---|
+| 1 | No seeds | `seed`/`top_p`/`top_k`/`repeat_penalty`/`stop` plumbed end-to-end: HTTP API → runtime (all stages incl. tool-plan, repair, agentic workers) → adapter payload → both provider engines. `Benchmark-MultiDeviceHarness.ps1` sends a fixed `-Seed 42` (MLPerf-style; `-Seed 0` disables). A fixed seed is necessary but not sufficient — batch composition still perturbs results (arXiv:2601.06118), so benchmark at concurrency 1. |
+| 2 | Fake NPU device | `--device npu` no longer silently maps to CUDA 0; it runs CPU with warning `npu_unsupported_by_transformers_backend_running_cpu`. Real NPU execution remains Lemonade-only. |
+| 3 | Chat-template mismatch | transformers path uses `tokenizer.apply_chat_template` when available (flat join only as last resort, with warning); llama.cpp raw fallback derives ChatML-aware stops instead of `["</s>", "\n\n\n"]`. |
+| 4 | Per-engine sampler drift | Explicit request sampling now overrides Ollama Modelfile params and engine defaults on every path. |
+| 5 | Route temps silently applied | `/v1/chat/completions` no longer injects `temperature=0.3`; generation knobs are forwarded only when the client sends them (both endpoints consistent). Route defaults still apply when omitted — by design, now documented. |
+| 6 | Misleading telemetry | `tokens_per_second` now uses final-generation time (`generation_ms`, new field); `ttft_ms` is `null` (no streaming exists). |
+| 7 | Stub masquerade | Any canned-answer substitution now emits `fallback_content_substituted` in provider warnings. Canned texts still exist for the diagnostic backend — do not benchmark against prompts they match. |
+| 8 | CPU context halved | Unchanged (config choice) — equalize `max_context` in the loadout yaml before context-sensitive comparisons. |
+| 9 | temperature=0 semantics | Unchanged per engine (greedy on transformers vs sampler elsewhere) — pin full sampling explicitly; now possible via #1. |
+
+Also fixed alongside (found in the deep-research review): response cache could never hit (volatile `run_id` + live `route_metadata` reference in the key); concurrent requests corrupted each other's checkpoints (per-request context object now); schema repair never ran on non-tool routes; all traces shared one import-time timestamp; thinking-model detection overrode strict-schema policy; `high_risk` keyword lockout now applies only in `hardening` mode.
+
 ## 1. What your benchmark tests send
 
 | Script | temperature | max_tokens | seed | notes |

@@ -47,6 +47,8 @@ The production runtime can drive several model backends at once — one per proc
 
 Known gap: `fallback_chain` currently orders the backend plan only — if the selected backend fails mid-request, the runtime does not yet retry the next device automatically.
 
+Reproducible benchmarking: requests accept `seed`, `top_p`, `top_k`, `repeat_penalty`, and `stop`, forwarded identically to every backend; `Benchmark-MultiDeviceHarness.ps1` pins `-Seed 42` by default. Execution telemetry reports `generation_ms`-based `tokens_per_second` (whole-pipeline latency stays in `runtime_ms`; `ttft_ms` is `null` — no streaming). See `docs/model-parameters-audit.md` for the full parameter map and remaining caveats.
+
 ### Quick commands
 
 - Demo run:
