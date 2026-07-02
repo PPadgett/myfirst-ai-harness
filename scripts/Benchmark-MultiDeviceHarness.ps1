@@ -16,6 +16,9 @@ param(
     [int]$Iterations = 10,
     [double]$Temperature = 0.2,
     [int]$MaxTokens = 256,
+    # Fixed seed for reproducible cross-device comparison (MLPerf-style fixed
+    # LoadGen seed; alternate seeds probe variance). Pass -Seed 0 to disable.
+    [int]$Seed = 42,
     [string]$Model = "",
     [string]$Prompt = "",
     [string]$ExecutionProfileOverride = "",
@@ -344,6 +347,9 @@ function Invoke-BenchmarkRequest {
         temperature = $Temperature
         route = $CaseDef.route
         request_id = "md-bench-" + [guid]::NewGuid().ToString("N")
+    }
+    if ($Seed -ne 0) {
+        $payload.seed = [int]$Seed
     }
     if (-not [string]::IsNullOrWhiteSpace($ModelOverride)) {
         $payload.model = $ModelOverride
@@ -782,6 +788,7 @@ $final = [ordered]@{
         warmup_iterations = $WarmupIterations
         temperature = $Temperature
         max_tokens = $MaxTokens
+        seed = $Seed
         model = $Model
         custom_prompt = $customPromptEnabled
         prompt_chars = if ($customPromptEnabled) { $Prompt.Length } else { 0 }

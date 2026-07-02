@@ -255,38 +255,45 @@ def build_app(config: RuntimeConfig | None = None, *, config_path: str | None = 
     @app.post("/v1/chat/completions")
     async def chat(req: Request) -> JSONResponse:
         data = await req.json()
-        response = await runtime.process(
-            {
-                "messages": data.get("messages", []),
-                "model": data.get("model", cfg.model),
-                "temperature": data.get("temperature", 0.3),
-                "max_tokens": data.get("max_tokens", cfg.backend.max_tokens),
-                "response_schema": data.get("response_schema")
-                or _response_schema_from_format(data.get("response_format")),
-                "route": data.get("route"),
-                "execution_profile": data.get("execution_profile"),
-                "safety_profile": data.get("safety_profile", "default"),
-                "request_id": data.get("request_id"),
-                "toolset": data.get("toolset") or data.get("tools", []),
-            }
-        )
+        payload = {
+            "messages": data.get("messages", []),
+            "model": data.get("model", cfg.model),
+            "max_tokens": data.get("max_tokens", cfg.backend.max_tokens),
+            "response_schema": data.get("response_schema")
+            or _response_schema_from_format(data.get("response_format")),
+            "route": data.get("route"),
+            "execution_profile": data.get("execution_profile"),
+            "safety_profile": data.get("safety_profile", "default"),
+            "request_id": data.get("request_id"),
+            "toolset": data.get("toolset") or data.get("tools", []),
+        }
+        # Only forward generation knobs the client actually sent. The endpoint
+        # previously injected temperature=0.3 by default, silently overriding
+        # the per-route policy temperatures (and disagreeing with /v1/answer,
+        # which forwarded nothing).
+        for key in ("temperature", "seed", "top_p", "top_k", "repeat_penalty", "stop"):
+            if data.get(key) is not None:
+                payload[key] = data.get(key)
+        response = await runtime.process(payload)
         return JSONResponse(content=response)
 
     @app.post("/v1/answer")
     async def answer(req: Request) -> JSONResponse:
         data = await req.json()
-        response = await runtime.process(
-            {
-                "messages": [{"role": "user", "content": data.get("input", "")}],
-                "model": data.get("model", cfg.model),
-                "response_schema": data.get("response_schema")
-                or _response_schema_from_format(data.get("response_format")),
-                "route": data.get("route"),
-                "execution_profile": data.get("execution_profile"),
-                "safety_profile": data.get("safety_profile", "default"),
-                "request_id": data.get("request_id"),
-            }
-        )
+        payload = {
+            "messages": [{"role": "user", "content": data.get("input", "")}],
+            "model": data.get("model", cfg.model),
+            "response_schema": data.get("response_schema")
+            or _response_schema_from_format(data.get("response_format")),
+            "route": data.get("route"),
+            "execution_profile": data.get("execution_profile"),
+            "safety_profile": data.get("safety_profile", "default"),
+            "request_id": data.get("request_id"),
+        }
+        for key in ("temperature", "max_tokens", "seed", "top_p", "top_k", "repeat_penalty", "stop"):
+            if data.get(key) is not None:
+                payload[key] = data.get(key)
+        response = await runtime.process(payload)
         return JSONResponse(content=response)
 
     return app

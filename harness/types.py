@@ -21,6 +21,16 @@ class ModelGenerateRequest:
     reasoning_budget_tokens: int | None = None
     tools: list[dict[str, Any]] | None = None
     extra: dict[str, Any] | None = None
+    # Explicit sampling controls. When None, the backend's own defaults apply
+    # (which differ per engine - see docs/model-parameters-audit.md). Pin these
+    # for reproducible cross-backend comparisons. Note: a fixed seed is
+    # necessary but not sufficient for bit-identical outputs; batch composition
+    # also affects results (arXiv:2601.06118), so benchmark with concurrency 1.
+    seed: int | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    repeat_penalty: float | None = None
+    stop: list[str] | None = None
 
 
 @dataclass

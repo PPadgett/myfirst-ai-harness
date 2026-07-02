@@ -42,6 +42,21 @@ class OpenAICompatibleClient(BaseModelClient):
         if req.response_schema is not None:
             # Keep a broad compatibility path: most local providers honor JSON mode for schema-constrained flows.
             payload["response_format"] = {"type": "json_object"}
+        # Explicit sampling controls (only sent when set). seed/top_p are
+        # OpenAI-compatible; top_k/repeat_penalty/stop are honored by local
+        # providers such as Lemonade, llama.cpp server, and Ollama, and are
+        # ignored by servers that do not support them. Lemonade documents
+        # temperature/top_p/top_k/repeat_penalty/stop but not seed.
+        if req.seed is not None:
+            payload["seed"] = int(req.seed)
+        if req.top_p is not None:
+            payload["top_p"] = float(req.top_p)
+        if req.top_k is not None:
+            payload["top_k"] = int(req.top_k)
+        if req.repeat_penalty is not None:
+            payload["repeat_penalty"] = float(req.repeat_penalty)
+        if req.stop:
+            payload["stop"] = [str(item) for item in req.stop if str(item)]
         # Do not emit the Python SDK-only "extra_body" wrapper in raw HTTP
         # requests. Local OpenAI-compatible providers and Lemonade commonly
         # reject unknown top-level fields. Provider-specific request fields can
