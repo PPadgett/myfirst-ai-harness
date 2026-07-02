@@ -195,6 +195,81 @@ def _infer_llama_chat_format(template: str | None) -> str | None:
     return None
 
 
+def _resolve_torch_device(requested: str) -> tuple[int, str | None]:
+    """Map a requested device label to a transformers pipeline device, honestly.
+
+    Returns (device_arg, warning). The previous behavior mapped any non-"cpu"
+    label (including "npu") to torch device 0, i.e. CUDA GPU 0 - so an "NPU"
+    benchmark silently ran on the GPU or crashed to CPU. This provider has no
+    NPU execution path; only the Lemonade Ryzen AI backend runs on the NPU.
+    Unknown or unsupported labels now run on CPU with an explicit warning so
+    per-device comparisons cannot be silently mislabeled.
+    """
+    normalized = str(requested or "cpu").strip().lower()
+    if normalized in {"", "cpu"}:
+        return -1, None
+    if normalized in {"gpu", "cuda", "cuda:0"}:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return 0, None
+            return -1, "cuda_unavailable_running_cpu"
+        except Exception:
+            return -1, "torch_unavailable_running_cpu"
+    if normalized == "npu":
+        return -1, "npu_unsupported_by_transformers_backend_running_cpu"
+    return -1, f"unknown_device_{normalized}_running_cpu"
+
+
+def _render_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]], fallback_prompt: str) -> tuple[str, bool]:
+    """Render messages with the model's own chat template when available.
+
+    Prompt format dominates output quality for instruct-tuned models -
+    formatting alone can swing accuracy by tens of points (FormatSpread,
+    arXiv:2310.11324) - so flat string joins are only used as a last resort.
+    Returns (prompt, template_applied).
+    """
+    try:
+        template = getattr(tokenizer, "chat_template", None)
+        if template:
+            rendered = tokenizer.apply_chat_template(
+                [
+                    {"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
+                    for m in messages
+                    if isinstance(m, dict)
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            if isinstance(rendered, str) and rendered.strip():
+                return rendered, True
+    except Exception:
+        pass
+    return fallback_prompt, False
+
+
+def _derive_stop_tokens(
+    chat_format: str | None,
+    request_stop: list[str] | None,
+    params_stop: Any,
+) -> list[str]:
+    """Stop tokens for the raw-completion fallback path, in precedence order.
+
+    Replaces the previous hard-coded stop list, which used the wrong end token
+    for ChatML models and truncated any answer containing blank lines.
+    """
+    if request_stop:
+        return [str(item) for item in request_stop if str(item)]
+    if isinstance(params_stop, list) and params_stop:
+        return [str(item) for item in params_stop if str(item)]
+    if isinstance(params_stop, str) and params_stop:
+        return [params_stop]
+    if chat_format == "chatml":
+        return ["<|im_end|>"]
+    return ["</s>"]
+
+
 def _generation_params_from_ollama(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -327,6 +402,7 @@ class _ModelBackendRuntime:
         self.ollama_params = _read_optional_json(plan.ollama_params_path if plan else None)
         self.llama_cpp_chat_format = _infer_llama_chat_format(self.ollama_template)
         self.template_applied = bool(self.llama_cpp_chat_format)
+        self.device_warning: str | None = None
 
     def _build_prompt(self, messages: list[dict[str, Any]]) -> str:
         prompt = _to_str_list(messages).strip()
@@ -369,6 +445,11 @@ class _ModelBackendRuntime:
         temperature: float | None,
         max_tokens: int | None,
         allow_reasoning: bool = False,
+        seed: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        stop: list[str] | None = None,
     ) -> ProviderGenerationResult:
         _ = tools
         prepared_messages = _apply_model_thinking_control(
@@ -384,6 +465,10 @@ class _ModelBackendRuntime:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
+                    seed=seed,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repeat_penalty=repeat_penalty,
                 )
                 self.last_generation_error = None
                 return result
@@ -393,6 +478,11 @@ class _ModelBackendRuntime:
                     temperature=temperature,
                     max_tokens=max_tokens,
                     response_format=response_format,
+                    seed=seed,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repeat_penalty=repeat_penalty,
+                    stop=stop,
                 )
                 self.last_generation_error = None
                 return result
@@ -433,6 +523,10 @@ class _ModelBackendRuntime:
         temperature: float | None,
         max_tokens: int | None,
         response_format: dict[str, Any] | None,
+        seed: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
     ) -> ProviderGenerationResult:
         if not self.source:
             raise RuntimeError("transformer backend requires model source")
@@ -449,11 +543,13 @@ class _ModelBackendRuntime:
                 try:
                     tokenizer = AutoTokenizer.from_pretrained(self.source, local_files_only=True)
                     model = AutoModelForCausalLM.from_pretrained(self.source, local_files_only=True)
+                    device_arg, device_warning = _resolve_torch_device(self.device)
+                    self.device_warning = device_warning
                     self._pipeline = pipeline(
                         "text-generation",
                         model=model,
                         tokenizer=tokenizer,
-                        device=0 if self.device.lower() != "cpu" else -1,
+                        device=device_arg,
                     )
                 except Exception as exc:
                     self.last_load_error = str(exc)
@@ -461,7 +557,16 @@ class _ModelBackendRuntime:
                 self.model_load_succeeded = True
                 self.last_load_error = None
 
-            prompt = self._build_prompt(messages)
+            warnings: list[str] = []
+            if self.device_warning:
+                warnings.append(str(self.device_warning))
+
+            hf_tokenizer = getattr(self._pipeline, "tokenizer", None)
+            prompt, template_applied = _render_chat_prompt(hf_tokenizer, messages, self._build_prompt(messages))
+            self.template_applied = template_applied
+            if not template_applied:
+                warnings.append("chat_template_missing_flat_prompt_used")
+
             params: dict[str, Any] = {
                 "max_new_tokens": max_tokens or self.max_new_tokens,
                 "do_sample": False,
@@ -470,6 +575,21 @@ class _ModelBackendRuntime:
             if temperature is not None and float(temperature) > 0:
                 params["do_sample"] = True
                 params["temperature"] = float(temperature)
+                # Explicit sampling controls; when absent, the model's own
+                # generation_config.json defaults silently apply.
+                if top_p is not None:
+                    params["top_p"] = float(top_p)
+                if top_k is not None:
+                    params["top_k"] = int(top_k)
+            if repeat_penalty is not None:
+                params["repetition_penalty"] = float(repeat_penalty)
+            if seed is not None:
+                try:
+                    from transformers import set_seed as _hf_set_seed
+
+                    _hf_set_seed(int(seed))
+                except Exception:
+                    warnings.append("seed_requested_but_not_applied")
 
             outputs = self._pipeline(prompt, **params)
             if not outputs:
@@ -480,17 +600,26 @@ class _ModelBackendRuntime:
             if response_format and isinstance(response_format, dict) and response_format.get("type") == "json_object":
                 fallback = self._fallback_answer(prompt)
                 obj = {"answer": fallback, "model": self.model_id}
+                substituted = True
                 if generated.strip():
                     structured = _load_json_model(generated)
                     if structured is not None:
                         obj = structured
+                        substituted = False
+                if substituted:
+                    warnings.append("fallback_content_substituted")
                 content = json.dumps(obj, ensure_ascii=False)
             else:
-                content = generated.strip() if generated else self._fallback_answer(prompt)
+                if generated.strip():
+                    content = generated.strip()
+                else:
+                    content = self._fallback_answer(prompt)
+                    warnings.append("fallback_content_substituted")
             content, reasoning, reasoning_extracted = _split_reasoning_content(content)
             effective_max = max_tokens or self.max_new_tokens
             truncated = _looks_truncated(content, finish_reason="stop", max_tokens=effective_max)
-            warnings = ["reasoning_extracted"] if reasoning_extracted else []
+            if reasoning_extracted:
+                warnings.append("reasoning_extracted")
             if truncated:
                 warnings.append("generation_may_be_truncated")
             return ProviderGenerationResult(
@@ -515,6 +644,11 @@ class _ModelBackendRuntime:
         temperature: float | None,
         max_tokens: int | None,
         response_format: dict[str, Any] | None,
+        seed: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        stop: list[str] | None = None,
     ) -> ProviderGenerationResult:
         if not self.source:
             raise RuntimeError("llamacpp backend requires a GGUF model source")
@@ -555,9 +689,25 @@ class _ModelBackendRuntime:
                 ),
                 "max_tokens": max_tokens or self.max_new_tokens,
             }
+            # Sampling precedence: explicit request > Ollama Modelfile params >
+            # llama.cpp library defaults. Without this, top_p/top_k silently
+            # differ per model store, breaking cross-device comparability.
+            request_sampling: dict[str, Any] = {}
+            if top_p is not None:
+                request_sampling["top_p"] = float(top_p)
+            if top_k is not None:
+                request_sampling["top_k"] = int(top_k)
+            if repeat_penalty is not None:
+                request_sampling["repeat_penalty"] = float(repeat_penalty)
+            if stop:
+                request_sampling["stop"] = [str(item) for item in stop if str(item)]
             for key in ("top_p", "top_k", "repeat_penalty", "stop"):
-                if key in params:
+                if key in request_sampling:
+                    payload[key] = request_sampling[key]
+                elif key in params:
                     payload[key] = params[key]
+            if seed is not None:
+                payload["seed"] = int(seed)
             if response_format and isinstance(response_format, dict):
                 payload["response_format"] = response_format
             try:
@@ -590,13 +740,18 @@ class _ModelBackendRuntime:
                 )
             except Exception:
                 prompt = self._build_prompt(messages)
-                stop = params.get("stop", ["</s>", "\n\n\n"])
-                result = self._llama(
-                    prompt,
-                    max_tokens=max_tokens or self.max_new_tokens,
-                    temperature=payload["temperature"],
-                    stop=stop,
-                )
+                stop_tokens = _derive_stop_tokens(self.llama_cpp_chat_format, stop, params.get("stop"))
+                raw_kwargs: dict[str, Any] = {
+                    "max_tokens": max_tokens or self.max_new_tokens,
+                    "temperature": payload["temperature"],
+                    "stop": stop_tokens,
+                }
+                for key in ("top_p", "top_k", "repeat_penalty"):
+                    if key in payload:
+                        raw_kwargs[key] = payload[key]
+                if seed is not None:
+                    raw_kwargs["seed"] = int(seed)
+                result = self._llama(prompt, **raw_kwargs)
                 choice = result.get("choices", [{}])[0]
                 content = str(choice.get("text", "")).strip()
                 finish_reason = str(choice.get("finish_reason") or "stop")
@@ -1342,6 +1497,32 @@ def build_app(
             max_tokens_param = None
         allow_reasoning = _payload_allows_reasoning(payload)
 
+        def _opt_int(key: str) -> int | None:
+            value = payload.get(key)
+            try:
+                return int(value) if value is not None else None
+            except Exception:
+                return None
+
+        def _opt_float(key: str) -> float | None:
+            value = payload.get(key)
+            try:
+                return float(value) if value is not None else None
+            except Exception:
+                return None
+
+        seed_param = _opt_int("seed")
+        top_p_param = _opt_float("top_p")
+        top_k_param = _opt_int("top_k")
+        repeat_penalty_param = _opt_float("repeat_penalty")
+        stop_param = payload.get("stop")
+        if isinstance(stop_param, str):
+            stop_param = [stop_param] if stop_param else None
+        elif isinstance(stop_param, list):
+            stop_param = [str(item) for item in stop_param if str(item)] or None
+        else:
+            stop_param = None
+
         try:
             generation = await runtime.generate(
                 messages=messages,
@@ -1350,6 +1531,11 @@ def build_app(
                 temperature=temperature,
                 max_tokens=max_tokens_param,
                 allow_reasoning=allow_reasoning,
+                seed=seed_param,
+                top_p=top_p_param,
+                top_k=top_k_param,
+                repeat_penalty=repeat_penalty_param,
+                stop=stop_param,
             )
         except Exception as exc:
             if plan.backend == "auto" and fallback_allowed and runtime.backend in {"transformers", "llamacpp"}:
@@ -1367,6 +1553,11 @@ def build_app(
                     temperature=temperature,
                     max_tokens=max_tokens_param,
                     allow_reasoning=allow_reasoning,
+                    seed=seed_param,
+                    top_p=top_p_param,
+                    top_k=top_k_param,
+                    repeat_penalty=repeat_penalty_param,
+                    stop=stop_param,
                 )
             else:
                 print(f"Model backend generation failed for {plan.model_id}: {exc}", file=sys.stderr, flush=True)
