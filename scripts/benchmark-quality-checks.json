@@ -1,0 +1,27 @@
+{
+  "_comment": "Per-case answer-quality checks applied by gauntlet_report.py to the post-<think> answer text (case-insensitive). Types: nonempty_answer (>=20 chars after think-strip), contains, regex.",
+  "short_direct": [
+    {"type": "nonempty_answer"},
+    {"type": "regex", "value": "(routing|multi-device|device)"}
+  ],
+  "tool_required_short": [
+    {"type": "nonempty_answer"},
+    {"type": "contains", "value": "43"}
+  ],
+  "direct_long": [
+    {"type": "nonempty_answer"}
+  ],
+  "near_context_limit": [
+    {"type": "nonempty_answer"}
+  ],
+  "structured_extraction": [
+    {"type": "nonempty_answer"},
+    {"type": "regex", "value": "risk"},
+    {"type": "regex", "value": "mitigat"}
+  ],
+  "agentic_parallel_complex": [
+    {"type": "nonempty_answer"},
+    {"type": "regex", "value": "twist"},
+    {"type": "regex", "value": "(checklist|revision)"}
+  ]
+}
