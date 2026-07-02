@@ -90,17 +90,21 @@ if (-not $SkipPreflight.IsPresent) {
     Write-Step "Preflight: llama-cpp-python GPU offload capability"
     $offload = Test-GpuOffloadSupport
     if ($offload -ne "True") {
-        $wheelIndex = "https://abetlen.github.io/llama-cpp-python/whl/vulkan"
-        $wheelSpec = "llama-cpp-python==0.3.31"
+        # Direct artifact URL: an --index-url install excluded PyPI and broke
+        # dependency resolution (typing-extensions), while --extra-index-url
+        # would let pip pick PyPI's CPU build of the same version. The direct
+        # URL pins the exact Vulkan artifact; --no-deps is safe because the
+        # dependencies are already satisfied by the existing install.
+        $wheelUrl = "https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.31-vulkan/llama_cpp_python-0.3.31-py3-none-win_amd64.whl"
         if ($NoAutoFix.IsPresent) {
-            $warning = "llama-cpp-python reports gpu_offload_supported=$offload. The 'gpu' rows will run on CPU. Fix: pip install $wheelSpec --force-reinstall --no-cache-dir --index-url $wheelIndex"
+            $warning = "llama-cpp-python reports gpu_offload_supported=$offload. The 'gpu' rows will run on CPU. Fix: pip install $wheelUrl --force-reinstall --no-deps --no-cache-dir"
             $preflightWarnings += $warning
             Write-Warning $warning
         } elseif ($DryRun.IsPresent) {
-            Write-Plan ("AUTO-FIX would run: " + $venvPython + " -m pip install " + $wheelSpec + " --force-reinstall --no-cache-dir --index-url " + $wheelIndex)
+            Write-Plan ("AUTO-FIX would run: " + $venvPython + " -m pip install " + $wheelUrl + " --force-reinstall --no-deps --no-cache-dir")
         } else {
-            Write-Step ("AUTO-FIX: installing Vulkan wheel (" + $wheelSpec + ") - vendor-neutral, exact version pin")
-            & $venvPython -m pip install $wheelSpec --force-reinstall --no-cache-dir --index-url $wheelIndex
+            Write-Step "AUTO-FIX: installing Vulkan wheel 0.3.31 (direct artifact, vendor-neutral, exact version pin)"
+            & $venvPython -m pip install $wheelUrl --force-reinstall --no-deps --no-cache-dir
             if ($LASTEXITCODE -ne 0) { throw "Vulkan wheel install failed (exit $LASTEXITCODE). See docs/fix-plan-2026-07-02.md Phase B.2." }
             $offload = Test-GpuOffloadSupport
             $vulkanDll = Join-Path $repoRoot ".venv\Lib\site-packages\llama_cpp\lib\ggml-vulkan.dll"
