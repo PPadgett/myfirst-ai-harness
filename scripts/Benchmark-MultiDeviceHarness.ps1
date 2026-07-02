@@ -143,6 +143,7 @@ $testMatrix = @(
         context_tier = "complex_multi_step"
         expected_context_tokens = 120
         expected_max_output_tokens = 512
+        max_tokens = 512
         note = "Complex prompt should trigger CPU controller plus NPU/GPU workers."
     }
 )
@@ -341,9 +342,10 @@ function Invoke-BenchmarkRequest {
         [string]$ModelOverride
     )
 
+    $caseMaxTokens = if ($CaseDef.ContainsKey("max_tokens") -and $CaseDef["max_tokens"]) { [int]$CaseDef["max_tokens"] } else { [int]$MaxTokens }
     $payload = [ordered]@{
         messages = $CaseDef.messages
-        max_tokens = [int]$MaxTokens
+        max_tokens = $caseMaxTokens
         temperature = $Temperature
         route = $CaseDef.route
         request_id = "md-bench-" + [guid]::NewGuid().ToString("N")
@@ -647,6 +649,22 @@ $rows = @()
 $backendBuckets = @{}
 $routeBuckets = @{}
 $overall = New-Accumulator
+# Seeded determinism self-check: with a fixed seed, each case should produce
+# exactly one distinct output across iterations. distinct_outputs > 1 flags a
+# regression (e.g. volatile fields leaking into prompts).
+function Get-DeterminismSummary {
+    param([object[]]$Rows)
+    $summary = [ordered]@{}
+    foreach ($group in ($Rows | Group-Object -Property case_id)) {
+        $distinct = @($group.Group | ForEach-Object { [string]$_.response_text } | Sort-Object -Unique)
+        $summary[$group.Name] = [ordered]@{
+            iterations = $group.Count
+            distinct_outputs = $distinct.Count
+            deterministic = ($distinct.Count -le 1)
+        }
+    }
+    return $summary
+}
 
 foreach ($case in $testMatrix) {
     Write-Host ("Running case: " + $case.id + " (" + $case.route + ")")
@@ -778,6 +796,8 @@ $overallSummary = [ordered]@{
     tokens_per_second_avg = if ($overall.tps.Count -gt 0) { [math]::Round(($overall.tps | Measure-Object -Average).Average, 3) } else { 0 }
 }
 
+$determinismSummary = Get-DeterminismSummary -Rows $rows
+
 $final = [ordered]@{
     metadata = [ordered]@{
         benchmark_run_id = $runId
@@ -800,6 +820,7 @@ $final = [ordered]@{
     overall = $overallSummary
     backend_summary = $backendSummary
     route_summary = $routeSummary
+    determinism = $determinismSummary
     cases = $rows
 }
 
