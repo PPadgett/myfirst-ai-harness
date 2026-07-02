@@ -10,11 +10,16 @@ and harnessd were started by hand (and died by hand - see the Ctrl+C
 incident). This script owns the lifecycle with a try/finally so the stack is
 stopped even when a step throws.
 
-Preflight verifies the things no code fix can create: the Lemonade hybrid
-model must be present in the catalog at the hybrid base URL, and the venv's
-llama-cpp-python build is probed for GPU offload support (a CPU-only wheel
-silently ignores n_gpu_layers; that exact condition invalidated the "gpu"
-rows of the 2026-07-02 runs).
+Preflight verifies AND (by default) repairs the two environment
+prerequisites, since this script runs on the host where they can be fixed:
+- Lemonade hybrid model absent from the catalog -> runs
+  "lemonade-server pull <model>" and re-checks (registration in the catalog
+  does not imply downloaded weights).
+- llama-cpp-python without GPU offload support -> reinstalls the pinned
+  Vulkan build (0.3.31, vendor-neutral: works on AMD and NVIDIA drivers) into
+  the venv and re-probes. A CPU-only wheel silently ignores n_gpu_layers;
+  that exact condition invalidated the "gpu" rows of the 2026-07-02 runs.
+Pass -NoAutoFix for check-only behavior; -DryRun prints planned fixes.
 
 .EXAMPLE
 .\scripts\Invoke-HarnessBenchmarkGauntlet.ps1 -DryRun
@@ -44,6 +49,7 @@ param(
     [string]$HybridModel = "Qwen2.5-3B-Instruct-Hybrid",
     [switch]$SkipPreflight,
     [switch]$SkipHybridCheck,
+    [switch]$NoAutoFix,
     [switch]$KeepStackRunning,
     [switch]$DryRun
 )
@@ -75,32 +81,95 @@ if (-not $SkipPreflight.IsPresent) {
         throw "Config not found: $Config"
     }
 
+    function Test-GpuOffloadSupport {
+        try {
+            return ((& $venvPython -c "import llama_cpp,sys;sys.stdout.write(str(llama_cpp.llama_supports_gpu_offload()))" 2>$null | Out-String).Trim())
+        } catch { return "probe_failed" }
+    }
+
     Write-Step "Preflight: llama-cpp-python GPU offload capability"
-    $offload = ""
-    try {
-        $offload = (& $venvPython -c "import llama_cpp,sys;sys.stdout.write(str(llama_cpp.llama_supports_gpu_offload()))" 2>$null | Out-String).Trim()
-    } catch { $offload = "probe_failed" }
+    $offload = Test-GpuOffloadSupport
     if ($offload -ne "True") {
-        $warning = "llama-cpp-python reports gpu_offload_supported=$offload. The 'gpu' rows will run on CPU. Fix: reinstall an accelerated wheel (see docs/fix-plan-2026-07-02.md Phase B.2)."
-        $preflightWarnings += $warning
-        Write-Warning $warning
+        $wheelIndex = "https://abetlen.github.io/llama-cpp-python/whl/vulkan"
+        $wheelSpec = "llama-cpp-python==0.3.31"
+        if ($NoAutoFix.IsPresent) {
+            $warning = "llama-cpp-python reports gpu_offload_supported=$offload. The 'gpu' rows will run on CPU. Fix: pip install $wheelSpec --force-reinstall --no-cache-dir --index-url $wheelIndex"
+            $preflightWarnings += $warning
+            Write-Warning $warning
+        } elseif ($DryRun.IsPresent) {
+            Write-Plan ("AUTO-FIX would run: " + $venvPython + " -m pip install " + $wheelSpec + " --force-reinstall --no-cache-dir --index-url " + $wheelIndex)
+        } else {
+            Write-Step ("AUTO-FIX: installing Vulkan wheel (" + $wheelSpec + ") - vendor-neutral, exact version pin")
+            & $venvPython -m pip install $wheelSpec --force-reinstall --no-cache-dir --index-url $wheelIndex
+            if ($LASTEXITCODE -ne 0) { throw "Vulkan wheel install failed (exit $LASTEXITCODE). See docs/fix-plan-2026-07-02.md Phase B.2." }
+            $offload = Test-GpuOffloadSupport
+            $vulkanDll = Join-Path $repoRoot ".venv\Lib\site-packages\llama_cpp\lib\ggml-vulkan.dll"
+            if ($offload -eq "True" -and (Test-Path -LiteralPath $vulkanDll)) {
+                Write-Step "AUTO-FIX verified: GPU offload now supported (ggml-vulkan.dll present)"
+            } else {
+                $warning = "Vulkan wheel installed but offload probe reports '$offload'. Check Vulkan drivers; 'gpu' rows may still run on CPU."
+                $preflightWarnings += $warning
+                Write-Warning $warning
+            }
+        }
     } else {
         Write-Step "Preflight: GPU offload supported"
     }
 
     if (-not $SkipHybridCheck.IsPresent) {
-        Write-Step "Preflight: Lemonade hybrid model catalog"
-        try {
-            $catalogRaw = Invoke-WebRequest -UseBasicParsing -Uri ($HybridBaseUrl.TrimEnd("/") + "/models") -TimeoutSec 10 -ErrorAction Stop
-            $catalog = $catalogRaw.Content | ConvertFrom-Json
-            $ids = @()
-            if ($catalog.PSObject.Properties.Name -contains "data") { $ids = @($catalog.data | ForEach-Object { [string]$_.id }) }
-            if ($ids -notcontains $HybridModel) {
-                throw ("Hybrid model '" + $HybridModel + "' not in Lemonade catalog. Available: " + ($ids -join ", ") + ". Fix: lemonade-server pull " + $HybridModel)
+        function Get-LemonadeCatalogIds {
+            try {
+                $catalogRaw = Invoke-WebRequest -UseBasicParsing -Uri ($HybridBaseUrl.TrimEnd("/") + "/models") -TimeoutSec 10 -ErrorAction Stop
+                $catalog = $catalogRaw.Content | ConvertFrom-Json
+                if ($catalog.PSObject.Properties.Name -contains "data") {
+                    return @($catalog.data | ForEach-Object { [string]$_.id })
+                }
+                return @()
+            } catch { return $null }
+        }
+
+        function Resolve-LemonadeCli {
+            foreach ($name in @("lemonade-server", "lemonade-server-dev")) {
+                $cmd = Get-Command $name -ErrorAction SilentlyContinue
+                if ($cmd) { return $cmd.Source }
             }
+            foreach ($candidate in @(
+                (Join-Path $env:LOCALAPPDATA "lemonade_server\lemonade-server.exe"),
+                (Join-Path $env:LOCALAPPDATA "Programs\lemonade-server\lemonade-server.exe")
+            )) {
+                if (Test-Path -LiteralPath $candidate) { return $candidate }
+            }
+            return $null
+        }
+
+        Write-Step "Preflight: Lemonade hybrid model catalog"
+        $ids = Get-LemonadeCatalogIds
+        if ($null -eq $ids) {
+            throw ("Lemonade unreachable at " + $HybridBaseUrl + ". Start Lemonade Server (auto-starting it is intentionally out of scope), or pass -SkipHybridCheck to proceed without the hybrid row.")
+        }
+        if ($ids -notcontains $HybridModel) {
+            $pullHint = "lemonade-server pull " + $HybridModel
+            if ($NoAutoFix.IsPresent) {
+                throw ("Hybrid model '" + $HybridModel + "' not in Lemonade catalog. Available: " + ($ids -join ", ") + ". Fix: " + $pullHint)
+            }
+            if ($DryRun.IsPresent) {
+                Write-Plan ("AUTO-FIX would run: " + $pullHint + " (model weights download; can take several minutes)")
+            } else {
+                $cli = Resolve-LemonadeCli
+                if (-not $cli) {
+                    throw ("Hybrid model missing and lemonade-server CLI not found on PATH. Run manually: " + $pullHint)
+                }
+                Write-Step ("AUTO-FIX: pulling hybrid model via " + $cli + " (this downloads weights; be patient)")
+                & $cli pull $HybridModel 2>&1 | ForEach-Object { Write-Host ("[lemonade] " + $_) }
+                if ($LASTEXITCODE -ne 0) { throw ("lemonade-server pull failed (exit " + $LASTEXITCODE + "). Check Lemonade logs; see docs/fix-plan-2026-07-02.md Phase B.1 escalation paths.") }
+                $ids = Get-LemonadeCatalogIds
+                if ($null -eq $ids -or $ids -notcontains $HybridModel) {
+                    throw ("Pull completed but '" + $HybridModel + "' still absent from the catalog. Escalate per Phase B.1 (DLL/driver signatures).")
+                }
+                Write-Step "AUTO-FIX verified: hybrid model now in catalog"
+            }
+        } else {
             Write-Step ("Preflight: hybrid model present (" + $HybridModel + ")")
-        } catch {
-            throw ("Lemonade preflight failed at " + $HybridBaseUrl + " - " + $_.Exception.Message + " (start Lemonade Server, or pass -SkipHybridCheck to proceed without the hybrid row)")
         }
     }
 }
