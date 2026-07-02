@@ -21,6 +21,15 @@ class _FakeLlama:
         self.kwargs = kwargs
         self.__class__.instances.append(self)
 
+    def __call__(self, prompt: str, **kwargs: object) -> dict[str, object]:
+        record: dict[str, object] = {"prompt": prompt}
+        record.update(kwargs)
+        self.__class__.calls.append(record)
+        return {
+            "choices": [{"text": self.__class__.response_content, "finish_reason": self.__class__.finish_reason}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+        }
+
     def create_chat_completion(self, **payload: object) -> dict[str, object]:
         self.__class__.calls.append(payload)
         return {
@@ -193,12 +202,17 @@ def test_local_model_provider_uses_ollama_template_params_and_no_think(
     assert payload["model_source"] == str(model_blob)
     assert _FakeLlama.instances[0].kwargs["chat_format"] == "chatml"
     request_payload = _FakeLlama.calls[0]
+    # Non-reasoning Qwen3 requests use the raw ChatML prompt with an empty
+    # think-block prefill (the reliable non-thinking method); the legacy
+    # /no_think soft switch is ignored by small quants.
+    prompt = str(request_payload["prompt"])
+    assert prompt.endswith("<think>\n\n</think>\n\n")
+    assert "<|im_start|>assistant" in prompt
     assert request_payload["temperature"] == 0.6
     assert request_payload["top_p"] == 0.95
     assert request_payload["top_k"] == 20
     assert request_payload["repeat_penalty"] == 1.0
     assert request_payload["stop"] == ["<|im_start|>", "<|im_end|>"]
-    assert request_payload["messages"][-1]["content"].endswith("/no_think")
 
 
 def test_local_model_provider_reasoning_request_uses_qwen_think(

@@ -270,6 +270,19 @@ def _derive_stop_tokens(
     return ["</s>"]
 
 
+def _render_chatml_prompt(messages: list[dict[str, Any]]) -> str:
+    """ChatML prompt ending in an open assistant turn (enables prefill control)."""
+    parts: list[str] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "user"))
+        content = str(item.get("content", ""))
+        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+    parts.append("<|im_start|>assistant\n")
+    return "".join(parts)
+
+
 def _generation_params_from_ollama(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -403,6 +416,7 @@ class _ModelBackendRuntime:
         self.llama_cpp_chat_format = _infer_llama_chat_format(self.ollama_template)
         self.template_applied = bool(self.llama_cpp_chat_format)
         self.device_warning: str | None = None
+        self.gpu_offload_supported: bool | None = None
 
     def _build_prompt(self, messages: list[dict[str, Any]]) -> str:
         prompt = _to_str_list(messages).strip()
@@ -483,6 +497,7 @@ class _ModelBackendRuntime:
                     top_k=top_k,
                     repeat_penalty=repeat_penalty,
                     stop=stop,
+                    allow_reasoning=allow_reasoning,
                 )
                 self.last_generation_error = None
                 return result
@@ -649,6 +664,7 @@ class _ModelBackendRuntime:
         top_k: int | None = None,
         repeat_penalty: float | None = None,
         stop: list[str] | None = None,
+        allow_reasoning: bool = True,
     ) -> ProviderGenerationResult:
         if not self.source:
             raise RuntimeError("llamacpp backend requires a GGUF model source")
@@ -668,7 +684,10 @@ class _ModelBackendRuntime:
                         "n_ctx": self.llama_cpp_n_ctx,
                         "n_gpu_layers": self.llama_cpp_n_gpu_layers,
                         "n_threads": self.llama_cpp_n_threads,
-                        "verbose": False,
+                        # Verbose load output was unconditionally suppressed,
+                        # which hid the fact that a CPU-only wheel ignored
+                        # n_gpu_layers. Enable via HARNESS_LLAMACPP_VERBOSE=1.
+                        "verbose": os.getenv("HARNESS_LLAMACPP_VERBOSE", "0") == "1",
                     }
                     if self.llama_cpp_chat_format:
                         llama_args["chat_format"] = self.llama_cpp_chat_format
@@ -678,6 +697,19 @@ class _ModelBackendRuntime:
                     raise
                 self.model_load_succeeded = True
                 self.last_load_error = None
+                try:
+                    import llama_cpp as _llama_cpp_mod
+
+                    self.gpu_offload_supported = bool(_llama_cpp_mod.llama_supports_gpu_offload())
+                except Exception:
+                    self.gpu_offload_supported = None
+                print(
+                    "llamacpp loaded: "
+                    f"model={self.model_id} n_gpu_layers={self.llama_cpp_n_gpu_layers} "
+                    f"gpu_offload_supported={self.gpu_offload_supported}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
             params = _generation_params_from_ollama(self.ollama_params)
             payload: dict[str, Any] = {
@@ -710,6 +742,52 @@ class _ModelBackendRuntime:
                 payload["seed"] = int(seed)
             if response_format and isinstance(response_format, dict):
                 payload["response_format"] = response_format
+
+            def _offload_warning(target: list[str]) -> None:
+                if self.llama_cpp_n_gpu_layers > 0 and self.gpu_offload_supported is False:
+                    target.append("gpu_layers_requested_but_cpu_only_build")
+
+            # Reliable non-thinking mode for Qwen3: the legacy /no_think soft
+            # switch is unreliably honored by small quants (observed: 100/120
+            # benchmark rows truncated inside <think>), and the modern
+            # template-level enable_thinking flag is not reachable through the
+            # generic chatml handler. Prefill an empty think block on a raw
+            # ChatML prompt instead - the documented reliable method.
+            if not allow_reasoning and _is_qwen3_model(self.model_id) and not response_format:
+                prompt = _render_chatml_prompt(messages) + "<think>\n\n</think>\n\n"
+                stop_tokens = _derive_stop_tokens("chatml", stop, params.get("stop"))
+                raw_kwargs: dict[str, Any] = {
+                    "max_tokens": payload["max_tokens"],
+                    "temperature": payload["temperature"],
+                    "stop": stop_tokens,
+                }
+                for key in ("top_p", "top_k", "repeat_penalty"):
+                    if key in payload:
+                        raw_kwargs[key] = payload[key]
+                if seed is not None:
+                    raw_kwargs["seed"] = int(seed)
+                result = self._llama(prompt, **raw_kwargs)
+                choice = result.get("choices", [{}])[0]
+                content = str(choice.get("text", "")).strip()
+                finish_reason = str(choice.get("finish_reason") or "stop")
+                content, reasoning, reasoning_extracted = _split_reasoning_content(content)
+                truncated = _looks_truncated(content, finish_reason=finish_reason, max_tokens=payload["max_tokens"])
+                warnings = ["qwen3_nothink_prefill"]
+                _offload_warning(warnings)
+                if reasoning_extracted:
+                    warnings.append("reasoning_extracted")
+                if truncated:
+                    warnings.append("generation_may_be_truncated")
+                return ProviderGenerationResult(
+                    content=content,
+                    reasoning=reasoning,
+                    finish_reason="length" if truncated else finish_reason,
+                    usage=_normalize_usage(result.get("usage", {})),
+                    truncated=truncated,
+                    warnings=warnings,
+                    raw=result,
+                )
+
             try:
                 result = self._llama.create_chat_completion(**payload)
                 choice = result.get("choices", [{}])[0]
@@ -723,6 +801,7 @@ class _ModelBackendRuntime:
                     reasoning = parsed_reasoning
                 truncated = _looks_truncated(content, finish_reason=finish_reason, max_tokens=payload["max_tokens"])
                 warnings = []
+                _offload_warning(warnings)
                 if reasoning_extracted:
                     warnings.append("reasoning_extracted")
                 if truncated:
@@ -758,6 +837,7 @@ class _ModelBackendRuntime:
                 content, reasoning, reasoning_extracted = _split_reasoning_content(content)
                 truncated = _looks_truncated(content, finish_reason=finish_reason, max_tokens=max_tokens or self.max_new_tokens)
                 warnings = ["llamacpp_chat_completion_fallback"]
+                _offload_warning(warnings)
                 if reasoning_extracted:
                     warnings.append("reasoning_extracted")
                 if truncated:
