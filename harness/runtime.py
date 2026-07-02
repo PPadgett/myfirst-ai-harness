@@ -9,7 +9,7 @@ import os
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -90,6 +90,24 @@ class BackendBinding:
     model: str
     client: BaseModelClient
     config: BackendConfig | None = None
+
+
+@dataclass
+class _RequestContext:
+    """Mutable per-request state.
+
+    These previously lived as attributes on the shared HarnessRuntime
+    instance. FastAPI serves requests concurrently on one runtime object, and
+    every `await` on a model call was a point where two in-flight requests
+    interleaved and corrupted each other's trace ids, checkpoint refs, and
+    checkpoint diffs. Keeping them on a context object owned by process()
+    makes each request self-contained.
+    """
+
+    run_id: str
+    trace_id: str
+    checkpoint_refs: list[str] = field(default_factory=list)
+    last_checkpoint_state: dict[str, Any] = field(default_factory=dict)
 
 
 class HarnessRuntime:
@@ -325,6 +343,11 @@ class HarnessRuntime:
         requested_max_tokens: int,
         final_schema: dict[str, Any] | None,
         fallback_controller: BackendBinding,
+        seed: int | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
+        stop: list[str] | None = None,
     ) -> tuple[ModelGenerateResult, dict[str, Any], BackendBinding]:
         bindings = self._backend_bindings()
         controller = next((binding for binding in bindings if self._binding_matches_device(binding, "cpu")), fallback_controller)
@@ -359,6 +382,11 @@ class HarnessRuntime:
                 max_new_tokens=max(128, min(512, requested_max_tokens // 2)),
                 response_schema=None,
                 allow_reasoning=False,
+                seed=seed,
+                top_p=top_p,
+                top_k=top_k,
+                repeat_penalty=repeat_penalty,
+                stop=stop,
             )
             started = time.perf_counter()
             try:
@@ -404,6 +432,11 @@ class HarnessRuntime:
             max_new_tokens=requested_max_tokens,
             response_schema=final_schema,
             allow_reasoning=False,
+            seed=seed,
+            top_p=top_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            stop=stop,
         )
         controller_started = time.perf_counter()
         controller_result = await controller.client.generate(controller_req)
@@ -445,6 +478,7 @@ class HarnessRuntime:
 
     def _backend_failure_response(
         self,
+        ctx: _RequestContext,
         request_id: str,
         route: RoutePolicy,
         model: str,
@@ -458,7 +492,7 @@ class HarnessRuntime:
     ) -> dict[str, Any]:
         base = _build_openai_like_response(
             request_id=request_id,
-            trace_id=self.trace_id,
+            trace_id=ctx.trace_id,
             model=model,
             text=f"Backend request failed during {stage}.",
             usage=usage or {"input_tokens": 0, "output_tokens": 0},
@@ -475,13 +509,13 @@ class HarnessRuntime:
             "failed_route_ids": [route.route.value],
             "error_codes": [error_code],
         }
-        checkpoint_id = self.checkpoint_refs[-1] if self.checkpoint_refs else None
+        checkpoint_id = ctx.checkpoint_refs[-1] if ctx.checkpoint_refs else None
         base.update(
             {
                 "status": "validation_block",
                 "run_id": run_id,
                 "checkpoint_id": checkpoint_id,
-                "trace_checkpoint_count": len(self.checkpoint_refs),
+                "trace_checkpoint_count": len(ctx.checkpoint_refs),
                 "route": route.route.value,
                 "policy": route.as_dict(),
                 "evidence_ids": [],
@@ -502,10 +536,7 @@ class HarnessRuntime:
                 "tool_sandbox_mode": self.tool_sandbox_mode,
             }
         )
-        latency_ms = 0
-        if usage is not None and isinstance(usage.get("input_tokens"), int):
-            # Keep shape compatibility with final response; exact latency is still computed by caller.
-            latency_ms = int(usage.get("input_tokens", 0) * 0 + usage.get("output_tokens", 0) * 0)
+        latency_ms = 0  # Failure paths do not measure generation latency.
         trace = TraceEvent(
             request_id=request_id,
             route=route.route.value,
@@ -515,10 +546,10 @@ class HarnessRuntime:
             status="validation_block",
             latency_ms=latency_ms,
             stages=[{"stage": stage, "status": "failed", "error_code": error_code}],
-            checkpoints=self._load_checkpoint_payloads(),
+            checkpoints=self._load_checkpoint_payloads(ctx),
             state_diffs={
-                "checkpoint_count": len(self.checkpoint_refs),
-                "latest_phase": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
+                "checkpoint_count": len(ctx.checkpoint_refs),
+                "latest_phase": ctx.checkpoint_refs[-1] if ctx.checkpoint_refs else None,
                 "latest_state_diffs": {},
             },
             request=redact_sensitive_args({"route": route.as_dict(), "error_code": error_code}),
@@ -547,13 +578,15 @@ class HarnessRuntime:
         messages = request.get("messages", [])
         request_id = request.get("request_id") or str(uuid.uuid4())
         run_id = str(uuid.uuid4())
+        ctx = _RequestContext(run_id=run_id, trace_id=str(uuid.uuid4()))
+        # Compatibility mirrors only; all internal per-request state lives on
+        # ctx so concurrent requests cannot corrupt each other's checkpoints.
         self.last_run_id = run_id
-        self.trace_id = str(uuid.uuid4())
-        self._last_checkpoint_state = {}
+        self.trace_id = ctx.trace_id
         model = request.get("model", self.config.model)
         response_schema = request.get("response_schema")
         route_override = request.get("route")
-        self.checkpoint_refs = []
+        self.checkpoint_refs = ctx.checkpoint_refs
 
         raw_user_text = _last_user_text(messages)
         trusted_input, untrusted_input = split_trusted_untrusted(raw_user_text)
@@ -573,6 +606,7 @@ class HarnessRuntime:
         )
 
         self._checkpoint(
+            ctx,
             phase="routing",
             run_id=run_id,
             attempt=1,
@@ -585,7 +619,7 @@ class HarnessRuntime:
             validation = {"ok": False, "missing_fields": ["route_confidence"], "failed_route_ids": [route.route.value]}
             response = _build_openai_like_response(
                 request_id=request_id,
-                trace_id=self.trace_id,
+                trace_id=ctx.trace_id,
                 model=model,
                 text="I need additional clarification before proceeding.",
                 usage={"input_tokens": 0, "output_tokens": 0},
@@ -597,6 +631,7 @@ class HarnessRuntime:
                 tool_plan="",
             )
             self._checkpoint(
+                ctx,
                 phase="validation",
                 run_id=run_id,
                 attempt=1,
@@ -611,8 +646,8 @@ class HarnessRuntime:
                     "route": route.route.value,
                     "next_action": "ask_clarification",
                     "validation": validation,
-                    "trace_checkpoint_count": len(self.checkpoint_refs),
-                    "checkpoint_id": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
+                    "trace_checkpoint_count": len(ctx.checkpoint_refs),
+                    "checkpoint_id": ctx.checkpoint_refs[-1] if ctx.checkpoint_refs else None,
                     "evidence": [],
                     "claims": [],
                     "trace": [],
@@ -628,7 +663,7 @@ class HarnessRuntime:
                     status=response["status"],
                     latency_ms=int((time.perf_counter() - start) * 1000),
                     stages=[],
-                    checkpoints=self._load_checkpoint_payloads(),
+                    checkpoints=self._load_checkpoint_payloads(ctx),
                     request=redact_sensitive_args({"messages": [{"role": "user", "content": raw_user_text}], "model": model, "route": route.route.value}),
                     result_summary={"status": response["status"], "validation": validation},
                 )
@@ -638,7 +673,7 @@ class HarnessRuntime:
         input_decision = check_input_text(user_text)
         if not input_decision.allow:
             return _error_payload(
-                self.trace_id,
+                ctx.trace_id,
                 request_id,
                 model,
                 route,
@@ -648,6 +683,7 @@ class HarnessRuntime:
 
         if self.require_evidence:
             self._checkpoint(
+                ctx,
                 phase="input_guard",
                 run_id=run_id,
                 attempt=1,
@@ -656,10 +692,13 @@ class HarnessRuntime:
                 payload={"decision": "passed"},
             )
 
-        # Policy hooks from route class.
+        # Policy hooks from route class. Thinking-capable model names may
+        # widen the reasoning budget, but never override a route whose policy
+        # forbids free-form reasoning (strict schema / structured extraction).
         model_name = str(model).lower()
         if any(prefix in model_name for prefix in self.config.thinking_model_prefixes):
-            route.allow_reasoning = True
+            if not (route.strict_schema or route.output_schema_required):
+                route.allow_reasoning = True
             if route.thinking_budget == "low":
                 route.thinking_budget = "medium"
 
@@ -678,18 +717,65 @@ class HarnessRuntime:
             route.use_tools = False
         requested_execution_profile = request.get("execution_profile")
 
-        # Cache key excludes volatile outputs.
+        requested_max_tokens = int(request.get("max_tokens", route.max_new_tokens))
+        requested_temp = float(request.get("temperature", route.temperature))
+        requested_temp = min(2.0, max(0.0, requested_temp))
+        requested_max_tokens = max(64, requested_max_tokens)
+
+        def _opt_int(key: str) -> int | None:
+            value = request.get(key)
+            try:
+                return int(value) if value is not None else None
+            except Exception:
+                return None
+
+        def _opt_float(key: str) -> float | None:
+            value = request.get(key)
+            try:
+                return float(value) if value is not None else None
+            except Exception:
+                return None
+
+        # Explicit sampling controls; forwarded to every model call so all
+        # backends receive identical generation parameters (a fixed seed alone
+        # is necessary but not sufficient for reproducibility - see
+        # docs/model-parameters-audit.md).
+        requested_seed = _opt_int("seed")
+        requested_top_p = _opt_float("top_p")
+        requested_top_k = _opt_int("top_k")
+        requested_repeat_penalty = _opt_float("repeat_penalty")
+        raw_stop = request.get("stop")
+        if isinstance(raw_stop, str):
+            requested_stop = [raw_stop] if raw_stop else None
+        elif isinstance(raw_stop, list):
+            requested_stop = [str(item) for item in raw_stop if str(item)] or None
+        else:
+            requested_stop = None
+
+        # Cache key excludes volatile outputs but includes every knob that
+        # changes generation. It previously contained run_id (a fresh UUID per
+        # request), which made every key unique: the cache could never hit.
         cache_key_payload = {
             "response_normalization_version": RESPONSE_NORMALIZATION_VERSION,
             "model": model,
             "messages": messages,
-            "policy": route.as_dict(),
+            # Deep-copy via JSON: as_dict() embeds a live reference to
+            # route_metadata, which process() mutates after the cache lookup
+            # (execution profile fields) - a live reference makes the PUT key
+            # differ from the GET key, so the cache never hits.
+            "policy": json.loads(json.dumps(route.as_dict(), sort_keys=True, default=str)),
             "schema": response_schema,
             "safety_profile": request.get("safety_profile", "default"),
             "route_override": route_override,
-            "run_id": run_id,
             "toolset": requested_toolset or [],
             "execution_profile": requested_execution_profile or "",
+            "temperature": requested_temp,
+            "max_tokens": requested_max_tokens,
+            "seed": requested_seed,
+            "top_p": requested_top_p,
+            "top_k": requested_top_k,
+            "repeat_penalty": requested_repeat_penalty,
+            "stop": requested_stop or [],
         }
 
         cache_hit = None
@@ -699,7 +785,7 @@ class HarnessRuntime:
                 cache_hit = dict(cache_hit)
                 cache_hit["id"] = f"ch_{cache_hit.get('id', request_id)}"
                 cache_hit["cached"] = True
-                cache_hit["trace_id"] = self.trace_id
+                cache_hit["trace_id"] = ctx.trace_id
                 cache_hit["run_id"] = run_id
                 cache_hit["checkpoint_id"] = None
                 cache_hit["validation"] = {"ok": True, "missing_fields": [], "failed_route_ids": []}
@@ -709,10 +795,6 @@ class HarnessRuntime:
                 cache_hit["trace_checkpoint_count"] = 0
                 return cache_hit
 
-        requested_max_tokens = int(request.get("max_tokens", route.max_new_tokens))
-        requested_temp = float(request.get("temperature", route.temperature))
-        requested_temp = min(2.0, max(0.0, requested_temp))
-        requested_max_tokens = max(64, requested_max_tokens)
         execution_profile, profile_source = self._resolve_execution_profile(
             requested_profile=requested_execution_profile,
             route=route,
@@ -743,6 +825,7 @@ class HarnessRuntime:
             evidence_ids = [doc.doc_id for doc in docs]
 
         self._checkpoint(
+            ctx,
             phase="retrieval",
             run_id=run_id,
             attempt=1,
@@ -770,12 +853,18 @@ class HarnessRuntime:
                 response_schema=tool_plan_schema,
                 tools=specs_as_openai_tools(route.allowed_tools),
                 allow_reasoning=False,
+                seed=requested_seed,
+                top_p=requested_top_p,
+                top_k=requested_top_k,
+                repeat_penalty=requested_repeat_penalty,
+                stop=requested_stop,
             )
             try:
                 tool_plan_res = await selected_client.generate(tool_plan_req)
             except RuntimeError as exc:
                 error_code = self._normalize_model_error(exc)
                 self._checkpoint(
+                    ctx,
                     phase="tool_plan",
                     run_id=run_id,
                     attempt=1,
@@ -785,6 +874,7 @@ class HarnessRuntime:
                     payload={"error": str(exc)},
                 )
                 return self._backend_failure_response(
+                    ctx,
                     request_id=request_id,
                     route=route,
                     model=selected_model,
@@ -804,6 +894,7 @@ class HarnessRuntime:
             parsed_plan_ok, parsed_plan, parse_reason = extract_first_json(tool_plan_res.text)
             tool_plan_answer = tool_plan_res.text or ""
             self._checkpoint(
+                ctx,
                 phase="tool_plan",
                 run_id=run_id,
                 attempt=1,
@@ -899,6 +990,7 @@ class HarnessRuntime:
             )
             if budget_exhausted:
                 self._checkpoint(
+                    ctx,
                     phase="tool_execution",
                     run_id=run_id,
                     attempt=1,
@@ -927,6 +1019,7 @@ class HarnessRuntime:
                 )
             else:
                 self._checkpoint(
+                    ctx,
                     phase="tool_execution",
                     run_id=run_id,
                     attempt=1,
@@ -946,6 +1039,7 @@ class HarnessRuntime:
             )
         else:
             self._checkpoint(
+                ctx,
                 phase="tool_plan",
                 run_id=run_id,
                 attempt=1,
@@ -954,6 +1048,7 @@ class HarnessRuntime:
                 payload={"tool_calls": 0},
             )
             self._checkpoint(
+                ctx,
                 phase="tool_execution",
                 run_id=run_id,
                 attempt=1,
@@ -964,6 +1059,7 @@ class HarnessRuntime:
 
         final_schema = response_schema if route.output_schema_required or route.strict_schema else None
         final_msg_prompt = prompt_messages.copy()
+        generation_started = time.perf_counter()
         try:
             if execution_profile == "agentic_parallel" and self.config.agentic_parallel_enabled:
                 final_res, agentic_parallel_metadata, selected_binding = await self._run_agentic_parallel(
@@ -972,6 +1068,11 @@ class HarnessRuntime:
                     requested_max_tokens=requested_max_tokens,
                     final_schema=final_schema,
                     fallback_controller=selected_binding,
+                    seed=requested_seed,
+                    top_p=requested_top_p,
+                    top_k=requested_top_k,
+                    repeat_penalty=requested_repeat_penalty,
+                    stop=requested_stop,
                 )
                 selected_client = selected_binding.client
                 selected_model = selected_binding.model or model
@@ -984,11 +1085,17 @@ class HarnessRuntime:
                     response_schema=final_schema,
                     allow_reasoning=route.allow_reasoning,
                     reasoning_budget_tokens=_budget_tokens(route.thinking_budget),
+                    seed=requested_seed,
+                    top_p=requested_top_p,
+                    top_k=requested_top_k,
+                    repeat_penalty=requested_repeat_penalty,
+                    stop=requested_stop,
                 )
                 final_res = await selected_client.generate(final_req)
         except RuntimeError as exc:
             error_code = self._normalize_model_error(exc)
             self._checkpoint(
+                ctx,
                 phase="final_generate",
                 run_id=run_id,
                 attempt=1,
@@ -998,6 +1105,7 @@ class HarnessRuntime:
                 payload={"error": str(exc), "tool_calls": [_tool_result_payload(r) for r in tool_results]},
             )
             return self._backend_failure_response(
+                ctx,
                 request_id=request_id,
                 route=route,
                 model=selected_model,
@@ -1009,6 +1117,7 @@ class HarnessRuntime:
                 usage=usage,
             )
 
+        generation_ms = int((time.perf_counter() - generation_started) * 1000)
         final_response_text = final_res.text
         final_reasoning = final_res.reasoning
         final_provider = _provider_diagnostics_from_raw(final_res.raw)
@@ -1033,7 +1142,11 @@ class HarnessRuntime:
             if not parse_ok:
                 schema_valid = False
                 parse_error = parsed_payload.get("errors", [])
-                if tool_plan_answer:
+                # Repair runs whenever a schema is required. It was gated on
+                # tool_plan_answer, which is only set on tool routes - so
+                # structured_extraction (the route that needs repair most)
+                # never got its retry.
+                if final_schema is not None:
                     repair_request = final_msg_prompt + [
                         {
                             "role": "assistant",
@@ -1049,11 +1162,17 @@ class HarnessRuntime:
                                 max_new_tokens=256,
                                 response_schema=final_schema,
                                 allow_reasoning=False,
+                                seed=requested_seed,
+                                top_p=requested_top_p,
+                                top_k=requested_top_k,
+                                repeat_penalty=requested_repeat_penalty,
+                                stop=requested_stop,
                             )
                         )
                     except RuntimeError as exc:
                         error_code = self._normalize_model_error(exc)
                         self._checkpoint(
+                            ctx,
                             phase="repair",
                             run_id=run_id,
                             attempt=1,
@@ -1063,6 +1182,7 @@ class HarnessRuntime:
                             payload={"error": str(exc)},
                         )
                         return self._backend_failure_response(
+                            ctx,
                             request_id=request_id,
                             route=route,
                             model=selected_model,
@@ -1124,6 +1244,7 @@ class HarnessRuntime:
         )
 
         self._checkpoint(
+            ctx,
             phase="validation",
             run_id=run_id,
             attempt=1,
@@ -1133,10 +1254,13 @@ class HarnessRuntime:
         )
 
         latency_ms = int((time.perf_counter() - start) * 1000)
-        output_tokens = int(usage.get("output_tokens", 0) or 0)
+        # Throughput is computed from the final-generation stage only. It was
+        # previously divided by whole-pipeline latency (retrieval, tool calls,
+        # checkpoint writes included), understating true backend speed.
+        final_gen_output_tokens = int((final_res.usage or {}).get("output_tokens", 0) or 0)
         tokens_per_second = 0.0
-        if latency_ms > 0 and output_tokens > 0:
-            tokens_per_second = round(output_tokens / (latency_ms / 1000.0), 4)
+        if generation_ms > 0 and final_gen_output_tokens > 0:
+            tokens_per_second = round(final_gen_output_tokens / (generation_ms / 1000.0), 4)
         attempts = [
             {
                 "backend_id": selected_binding.backend_id,
@@ -1158,7 +1282,11 @@ class HarnessRuntime:
             "selected_via": selected_via,
             "wait_ms": 0,
             "runtime_ms": latency_ms,
-            "ttft_ms": latency_ms,
+            # No streaming path exists, so time-to-first-token is unknown.
+            # Reporting total latency here (the old behavior) was misleading;
+            # consumers already null-check this field.
+            "ttft_ms": None,
+            "generation_ms": generation_ms,
             "tokens_per_second": tokens_per_second,
             "backend_plan": self._backend_plan_payload(backend_plan, selected_binding.backend_id),
         }
@@ -1170,7 +1298,7 @@ class HarnessRuntime:
 
         response = _build_openai_like_response(
             request_id=request_id,
-            trace_id=self.trace_id,
+            trace_id=ctx.trace_id,
             model=selected_model,
             text=final_response_text,
             usage=usage,
@@ -1187,8 +1315,8 @@ class HarnessRuntime:
             {
                 "status": status,
                 "run_id": run_id,
-                "checkpoint_id": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
-                "trace_checkpoint_count": len(self.checkpoint_refs),
+                "checkpoint_id": ctx.checkpoint_refs[-1] if ctx.checkpoint_refs else None,
+                "trace_checkpoint_count": len(ctx.checkpoint_refs),
                 "route": route.route.value,
                 "policy": route.as_dict(),
                 "evidence_ids": evidence_ids_for_response,
@@ -1231,9 +1359,9 @@ class HarnessRuntime:
                 "status": status,
                 "cached": False,
                 "run_id": run_id,
-                "checkpoint_id": self.checkpoint_refs[-1] if self.checkpoint_refs else None,
+                "checkpoint_id": ctx.checkpoint_refs[-1] if ctx.checkpoint_refs else None,
                 "validation": validation,
-                "trace_checkpoint_count": len(self.checkpoint_refs),
+                "trace_checkpoint_count": len(ctx.checkpoint_refs),
                 "execution": execution,
                 "provider": final_provider,
             }
@@ -1241,7 +1369,7 @@ class HarnessRuntime:
                 cache_value.update({key: final_provider.get(key) for key in PROVIDER_DIAGNOSTIC_KEYS if key in final_provider})
             self.cache.put(cache_key_payload, cache_value)
 
-        checkpoints_payload = self._load_checkpoint_payloads()
+        checkpoints_payload = self._load_checkpoint_payloads(ctx)
         trace = TraceEvent(
             request_id=request_id,
             route=route.route.value,
@@ -1271,6 +1399,7 @@ class HarnessRuntime:
 
     def _checkpoint(
         self,
+        ctx: _RequestContext,
         phase: str,
         run_id: str,
         attempt: int,
@@ -1292,7 +1421,7 @@ class HarnessRuntime:
             evidence_refs=safe_evidence_refs,
             payload=safe_payload,
         )
-        state_diffs = self._payload_diff(self._last_checkpoint_state, current_state)
+        state_diffs = self._payload_diff(ctx.last_checkpoint_state, current_state)
         path = write_checkpoint(
             out_dir=self.state_dir,
             run_id=run_id,
@@ -1307,8 +1436,8 @@ class HarnessRuntime:
             state_diffs=state_diffs,
             payload=safe_payload,
         )
-        self._last_checkpoint_state = current_state
-        self.checkpoint_refs.append(path)
+        ctx.last_checkpoint_state = current_state
+        ctx.checkpoint_refs.append(path)
 
     @staticmethod
     def _snapshot_checkpoint_payload(
@@ -1345,9 +1474,9 @@ class HarnessRuntime:
                 removed.append(key)
         return {"added": added, "removed": removed, "changed": changed}
 
-    def _load_checkpoint_payloads(self) -> list[dict[str, Any]]:
+    def _load_checkpoint_payloads(self, ctx: _RequestContext) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
-        for path in self.checkpoint_refs:
+        for path in ctx.checkpoint_refs:
             try:
                 with Path(path).open("r", encoding="utf-8") as f:
                     payload = json.load(f)
@@ -1393,11 +1522,11 @@ class HarnessRuntime:
             if isinstance(record, dict):
                 present.update(str(key) for key in record.keys())
 
-        for result in tool_results:
-            output = result.output
+        for tool_result in tool_results:
+            output = tool_result.output
             if isinstance(output, dict):
                 present.update(str(key) for key in output.keys())
-            if result.success is False:
+            if tool_result.success is False:
                 present.add("tool_error")
 
         if parsed is not None and isinstance(parsed, dict):
@@ -1484,7 +1613,7 @@ def _build_system_prompt(route: RoutePolicy, evidence_ids: list[str], snippets: 
             pieces.append(f"[evidence_{i}] {snippet}")
         pieces.append("When citing evidence, reference IDs like evidence_0, evidence_1.")
     if route.cite_evidence:
-        pieces.append("If uncertain, answer with insufficent_evidence and list missing evidence IDs.")
+        pieces.append("If uncertain, answer with insufficient_evidence and list missing evidence IDs.")
     if route.require_verification:
         pieces.append("Keep outputs concise and factual.")
     if route.require_confirmation:
