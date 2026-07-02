@@ -215,7 +215,12 @@ def _resolve_next_action(
         return "ask_clarification"
     if feature_level == "hardening" and confidence_gap < ask_gap:
         return "ask_clarification"
-    if route == Route.HIGH_RISK:
+    if route == Route.HIGH_RISK and feature_level == "hardening":
+        # Fail-closed only in hardening mode. The trigger regex matches bare
+        # words like "financial"/"legal"/"medical", so an unconditional block
+        # made any prompt containing them permanently unanswerable in the
+        # default profile. Basic mode proceeds; the route still carries
+        # require_confirmation and verification policy.
         return "ask_clarification"
     return "proceed"
 

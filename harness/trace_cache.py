@@ -22,7 +22,9 @@ class TraceEvent:
     result_summary: dict[str, Any]
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
     state_diffs: dict[str, Any] | None = None
-    created_at: str = datetime.now(timezone.utc).isoformat()
+    # default_factory: a plain default is evaluated once at import time, which
+    # stamped every trace in a process with the same created_at.
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class TraceStore:
