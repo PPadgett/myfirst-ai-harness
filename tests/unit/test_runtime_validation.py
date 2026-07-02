@@ -326,6 +326,10 @@ async def test_budget_exhaustion_includes_budget_guard_record(monkeypatch: pytes
     config.feature_level = "basic"
     config.require_evidence = False
     config.tool_allowlist = ("run_tests",)
+    # Isolate from the response cache: these tests exercised the tool path
+    # only because the cache key was broken and never hit; a warm cache would
+    # otherwise serve a prior run's cached response.
+    config.enable_cache = False
 
     runtime = HarnessRuntime(config, _MockClient())
     forced_route = RoutePolicy(
@@ -465,6 +469,10 @@ async def test_model_backend_unavailable_during_tool_plan_is_returned_as_validat
     config.feature_level = "basic"
     config.require_evidence = False
     config.tool_allowlist = ("run_tests",)
+    # Isolate from the response cache: these tests exercised the tool path
+    # only because the cache key was broken and never hit; a warm cache would
+    # otherwise serve a prior run's cached response.
+    config.enable_cache = False
 
     runtime = HarnessRuntime(config, _MockClient())
     forced_route = RoutePolicy(

@@ -1364,6 +1364,9 @@ class HarnessRuntime:
                 "trace_checkpoint_count": len(ctx.checkpoint_refs),
                 "execution": execution,
                 "provider": final_provider,
+                # Cache hits must be shape-faithful: consumers read tool_calls
+                # off cached responses too.
+                "tool_calls": tool_call_payloads,
             }
             if final_provider:
                 cache_value.update({key: final_provider.get(key) for key in PROVIDER_DIAGNOSTIC_KEYS if key in final_provider})
