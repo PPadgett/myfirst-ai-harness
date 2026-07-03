@@ -171,7 +171,7 @@ function Stop-HarnessKnownLLMProcesses {
             $_.ProcessId -ne $PID -and
             $knownNames -contains ([string]$_.Name).ToLowerInvariant()
         } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        ForEach-Object { _Stop-HarnessProcessTree -ProcessId $_.ProcessId }
 }
 
 function Stop-HarnessFresh {
@@ -189,14 +189,14 @@ function Stop-HarnessFresh {
 
     Get-CimInstance Win32_Process |
         Where-Object { $_.CommandLine -match "harness\.(server|local_model_provider)" } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        ForEach-Object { _Stop-HarnessProcessTree -ProcessId $_.ProcessId }
 
     $ports = @([int]$ServerPort) + @($portMap.Values | ForEach-Object { [int]$_ }) | Select-Object -Unique
     foreach ($port in $ports) {
         Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
             Select-Object -ExpandProperty OwningProcess -Unique |
             Where-Object { $_ -gt 0 -and $_ -ne $PID } |
-            ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+            ForEach-Object { _Stop-HarnessProcessTree -ProcessId $_ }
     }
 
     Start-Sleep -Seconds 2
@@ -297,7 +297,7 @@ function Invoke-HarnessSafeLemonadeUnload {
             -PassThru `
             -WindowStyle Hidden
         if (-not $process.WaitForExit(15000)) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            _Stop-HarnessProcessTree -ProcessId $process.Id
         }
     } catch {
     } finally {
@@ -365,7 +365,7 @@ function Start-HarnessLemonadeServer {
         }
     }
 
-    Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue
+    _Stop-HarnessProcessTree -ProcessId $serverProcess.Id
     throw "Timed out waiting for Lemonade server health endpoint: $healthUri"
 }
 
@@ -390,7 +390,7 @@ function Get-HarnessLemonadeBackendStatus {
         -WindowStyle Hidden
 
     if (-not $process.WaitForExit(60000)) {
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        _Stop-HarnessProcessTree -ProcessId $process.Id
         Write-Warning "Timed out querying Lemonade backends; will attempt backend installation."
         return ""
     }
@@ -593,7 +593,7 @@ function Start-HarnessDirectLlamaCppServer {
         }
     }
 
-    Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue
+    _Stop-HarnessProcessTree -ProcessId $serverProcess.Id
     throw "Timed out waiting for llama.cpp GPU backend health endpoint: $healthUri"
 }
 

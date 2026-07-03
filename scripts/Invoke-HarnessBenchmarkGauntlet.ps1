@@ -63,6 +63,29 @@ Set-Location $repoRoot
 . (Join-Path $scriptRoot "Invoke-HarnessOneShot.ps1")
 
 function Write-Step { param([string]$Message) Write-Host ("[gauntlet] " + $Message) }
+
+function Stop-HarnessPortListeners {
+    # Kills the process TREE of anything still listening on harness ports and
+    # returns ports that remain busy. Lemonade (:13305) is deliberately
+    # excluded - it is a user-managed application, not ours to kill.
+    param([int[]]$Ports)
+    foreach ($port in $Ports) {
+        $owners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique)
+        foreach ($procId in $owners) {
+            if ([int]$procId -gt 0) {
+                Write-Step ("Port sweep: killing process tree " + $procId + " on :" + $port)
+                & taskkill.exe /PID $procId /T /F *> $null
+            }
+        }
+    }
+    Start-Sleep -Seconds 1
+    $remaining = @()
+    foreach ($port in $Ports) {
+        if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { $remaining += $port }
+    }
+    return $remaining
+}
 function Write-Plan { param([string]$Message) Write-Host ("[gauntlet:plan] " + $Message) -ForegroundColor Cyan }
 
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
@@ -210,7 +233,10 @@ try {
     Write-Step "Clean slate: stopping any existing harness processes"
     try { $null = Stop-HarnessBackend -ExecutionMode local -Config $Config } catch { }
     try { $null = Stop-HarnessModelBackendFleet -Devices @("npu", "gpu", "cpu") } catch { }
-    Start-Sleep -Seconds 2
+    $busy = Stop-HarnessPortListeners -Ports @($ServerPort, 11433, 11434, 11435)
+    if ($busy.Count -gt 0) { throw ("Clean slate failed: ports still busy: " + ($busy -join ", ")) }
+    Write-Step "Clean slate verified: all harness ports free"
+    Start-Sleep -Seconds 1
 
     Write-Step "Starting model backends (npu, cpu)"
     $null = Start-HarnessModelBackendFleet -Devices @("npu", "cpu") -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LocalOnly
@@ -275,6 +301,15 @@ finally {
         if ($modelBackendsStarted) {
             Write-Step "Teardown: model backend fleet"
             try { $null = Stop-HarnessModelBackendFleet -Devices @("npu", "gpu", "cpu") } catch { Write-Warning ("fleet stop failed: " + $_.Exception.Message) }
+        }
+        # Teardown is only claimed after the ports are verifiably free -
+        # "teardown succeeded" previously coexisted with ~6.5 GB of orphaned
+        # model children still resident.
+        $busy = Stop-HarnessPortListeners -Ports @($ServerPort, 11433, 11434, 11435)
+        if ($busy.Count -gt 0) {
+            Write-Warning ("Teardown incomplete - ports still busy: " + ($busy -join ", ") + ". Inspect with: Get-NetTCPConnection -LocalPort " + ($busy -join ","))
+        } else {
+            Write-Step "Teardown verified: all harness ports free"
         }
     } else {
         Write-Step "KeepStackRunning: leaving stack up"

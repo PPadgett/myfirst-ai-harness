@@ -25,6 +25,19 @@ $Script:HarnessModelBackendSessionFile = Join-Path $Script:HarnessModelBackendSt
 $Script:HarnessLogDir = Join-Path $Script:HarnessRepoRoot "state\logs"
 $Script:HarnessModelBackendDefaultHost = "127.0.0.1"
 $Script:HarnessModelBackendDefaultPort = 11435
+
+function _Stop-HarnessProcessTree {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    if ($ProcessId -le 0) { return }
+    # Stop-Process kills only the single PID; harness backends run as
+    # parent+child pairs and the child holds the loaded model (observed:
+    # ~2 GB per backend surviving a "successful" teardown). taskkill /T
+    # fells the whole process tree; Stop-Process remains as fallback.
+    & taskkill.exe /PID $ProcessId /T /F *> $null
+    if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
+        _Stop-HarnessProcessTree -ProcessId $ProcessId
+    }
+}
 $Script:HarnessModelBackendDefaultModel = "local-foundation:v1"
 
 function _Resolve-FilePath {
@@ -2322,7 +2335,7 @@ function Start-HarnessBackend {
                         "'$RuntimeModel' does not match running model '$runningModel'."
                     )
                     if ($runningSession.process_id) {
-                        Stop-Process -Id $runningSession.process_id -Force -ErrorAction SilentlyContinue
+                        _Stop-HarnessProcessTree -ProcessId $runningSession.process_id
                         Wait-Process -Id $runningSession.process_id -Timeout 3 -ErrorAction SilentlyContinue
                     }
                     $existingSessions = @($existingSessions | Where-Object { $_.key -ne $entryKey })
@@ -2446,7 +2459,7 @@ function Start-HarnessBackend {
             if (Test-Path $stderrPath) {
                 $startupError = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
             }
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            _Stop-HarnessProcessTree -ProcessId $process.Id
             throw "Harness server at $($healthUrl) did not become ready after ${WaitSeconds}s. $startupError"
         }
 
@@ -2690,7 +2703,7 @@ function Stop-HarnessBackend {
             }
             if ($entry.process_id) {
                 if (Get-Process -Id $entry.process_id -ErrorAction SilentlyContinue) {
-                    Stop-Process -Id $entry.process_id -Force -ErrorAction SilentlyContinue
+                    _Stop-HarnessProcessTree -ProcessId $entry.process_id
                 }
             }
         }
@@ -3100,7 +3113,7 @@ function Start-HarnessModelBackend {
                 "'$Model' does not match running model '$runningModel'."
             )
             if ($runningSession.process_id) {
-                Stop-Process -Id $runningSession.process_id -Force -ErrorAction SilentlyContinue
+                _Stop-HarnessProcessTree -ProcessId $runningSession.process_id
                 Wait-Process -Id $runningSession.process_id -Timeout 3 -ErrorAction SilentlyContinue
             }
             $existingSessions = @($existingSessions | Where-Object { $_.key -ne $entryKey })
@@ -3253,7 +3266,7 @@ function Start-HarnessModelBackend {
         if (Test-Path $stderrPath) {
             $startupError = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
         }
-        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        _Stop-HarnessProcessTree -ProcessId $process.Id
         throw "Local model backend at $($healthUrl) did not become ready after ${WaitSeconds}s. $startupError"
     }
 
@@ -5006,7 +5019,7 @@ function Start-HarnessModelBackendFleet {
                     if (Test-Path $stderrPath) {
                         $startupError = (Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue).Trim()
                     }
-                    Stop-Process -Id $commandProcess.Id -Force -ErrorAction SilentlyContinue
+                    _Stop-HarnessProcessTree -ProcessId $commandProcess.Id
                     throw "Command backend at $healthProbeUrl did not become ready after ${WaitSeconds}s. $startupError"
                 }
                 $healthReachable = $false
@@ -5086,7 +5099,7 @@ function Start-HarnessModelBackendFleet {
                 }
             } catch {
                 if ($commandProcess -and $commandProcess.Id -gt 0) {
-                    Stop-Process -Id $commandProcess.Id -Force -ErrorAction SilentlyContinue
+                    _Stop-HarnessProcessTree -ProcessId $commandProcess.Id
                 }
                 $backendStartError = "[${target}:$port] $($_.Exception.Message)"
                 $errors += $backendStartError
@@ -5511,7 +5524,7 @@ function Stop-HarnessModelBackend {
                     if ($DryRun -or -not $shouldStop) {
                         $reason = "would_stop"
                     } else {
-                        Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+                        _Stop-HarnessProcessTree -ProcessId $pid
                         Start-Sleep -Milliseconds 250
                         $stillRunning = [bool](Get-Process -Id $pid -ErrorAction SilentlyContinue)
                         if ($stillRunning) {
@@ -5567,7 +5580,7 @@ function Stop-HarnessModelBackend {
                 $fallbackReason = if ($DryRun -or -not $shouldStop) {
                     "would_stop_fallback"
                 } else {
-                    Stop-Process -Id $fallbackPid -Force -ErrorAction SilentlyContinue
+                    _Stop-HarnessProcessTree -ProcessId $fallbackPid
                     Start-Sleep -Milliseconds 250
                     if ([bool](Get-Process -Id $fallbackPid -ErrorAction SilentlyContinue)) {
                         "timed_out"
@@ -6854,7 +6867,7 @@ error_code=$backendCode. $normalized
             return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
         } finally {
             if ($UseExistingServer -eq $false -and $startedServer -and $serverProcess -ne $null -and -not $serverProcess.HasExited) {
-                Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue
+                _Stop-HarnessProcessTree -ProcessId $serverProcess.Id
             }
             if ($runtimeEnv.Count -gt 0 -and -not $UseExistingServer) {
                 _Restore-ServerEnvironment -Environment $envSnapshot
