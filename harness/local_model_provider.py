@@ -1575,7 +1575,12 @@ def build_app(
         max_tokens_param = payload.get("max_tokens")
         if not isinstance(max_tokens_param, int):
             max_tokens_param = None
-        allow_reasoning = _payload_allows_reasoning(payload)
+        header_reasoning = req.headers.get("x-harness-reasoning")
+        if header_reasoning is not None:
+            # Explicit harness intent (route policy) beats payload heuristics.
+            allow_reasoning = header_reasoning.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            allow_reasoning = _payload_allows_reasoning(payload)
 
         def _opt_int(key: str) -> int | None:
             value = payload.get(key)

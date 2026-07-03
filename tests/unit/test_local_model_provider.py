@@ -390,3 +390,55 @@ def test_local_model_provider_auto_transformer_failure_can_explicitly_fallback(
     assert payload["choices"][0]["message"]["content"] == "I received your question: hello"
     assert payload["provider"]["generation_backend"] == "fallback"
     assert payload["provider"]["fallback_active"] is True
+
+
+def test_reasoning_header_enables_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """x-harness-reasoning: 1 must route to the thinking path (header wins)."""
+    _install_fake_llama_cpp(monkeypatch)
+    models_root = tmp_path / "ollama-models"
+    _write_ollama_store_with_template(models_root)
+
+    app = build_app(model="qwen3:4b", backend="auto", models_root=str(models_root))
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen3:4b", "messages": [{"role": "user", "content": "Think about it"}]},
+        headers={"x-harness-reasoning": "1"},
+    )
+    assert response.status_code == 200
+    request_payload = _FakeLlama.calls[0]
+    # thinking enabled -> chat path with /think directive, not the no-think prefill
+    assert "messages" in request_payload
+    assert str(request_payload["messages"][-1]["content"]).endswith("/think")
+
+
+def test_reasoning_header_disable_beats_payload_enable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Explicit header 0 overrides extra_body reasoning-enabled heuristics."""
+    _install_fake_llama_cpp(monkeypatch)
+    models_root = tmp_path / "ollama-models"
+    _write_ollama_store_with_template(models_root)
+
+    app = build_app(model="qwen3:4b", backend="auto", models_root=str(models_root))
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "qwen3:4b",
+            "messages": [{"role": "user", "content": "No thinking please"}],
+            "extra_body": {"reasoning": {"enabled": True}},
+        },
+        headers={"x-harness-reasoning": "0"},
+    )
+    assert response.status_code == 200
+    request_payload = _FakeLlama.calls[0]
+    # no-think prefill path: raw prompt with empty think block, no messages key
+    assert "prompt" in request_payload
+    assert str(request_payload["prompt"]).endswith("<think>\n\n</think>\n\n")

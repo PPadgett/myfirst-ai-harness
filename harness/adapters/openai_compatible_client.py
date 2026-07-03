@@ -31,6 +31,14 @@ class OpenAICompatibleClient(BaseModelClient):
         headers: dict[str, str] = dict(self.extra_headers)
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        # Reasoning intent travels as headers: unknown headers are ignored by
+        # every OpenAI-compatible server (unknown BODY fields are not - see
+        # Lemonade), while the harness-owned local provider reads them. Without
+        # this, route thinking budgets silently died at the HTTP boundary and
+        # the provider guessed from payload shape.
+        headers["x-harness-reasoning"] = "1" if req.allow_reasoning else "0"
+        if req.allow_reasoning and req.reasoning_budget_tokens is not None:
+            headers["x-harness-reasoning-budget"] = str(int(req.reasoning_budget_tokens))
         payload: dict[str, Any] = {
             "model": req.model or self.model,
             "messages": req.messages,
