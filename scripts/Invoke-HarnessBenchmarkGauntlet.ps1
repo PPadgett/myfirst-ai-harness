@@ -233,7 +233,7 @@ try {
     Write-Step "Clean slate: stopping any existing harness processes"
     try { $null = Stop-HarnessBackend -ExecutionMode local -Config $Config } catch { }
     try { $null = Stop-HarnessModelBackendFleet -Devices @("npu", "gpu", "cpu") } catch { }
-    $busy = Stop-HarnessPortListeners -Ports @($ServerPort, 11433, 11434, 11435)
+    $busy = @(Stop-HarnessPortListeners -Ports @($ServerPort, 11433, 11434, 11435))
     if ($busy.Count -gt 0) { throw ("Clean slate failed: ports still busy: " + ($busy -join ", ")) }
     Write-Step "Clean slate verified: all harness ports free"
     Start-Sleep -Seconds 1
@@ -305,7 +305,7 @@ finally {
         # Teardown is only claimed after the ports are verifiably free -
         # "teardown succeeded" previously coexisted with ~6.5 GB of orphaned
         # model children still resident.
-        $busy = Stop-HarnessPortListeners -Ports @($ServerPort, 11433, 11434, 11435)
+        $busy = @(Stop-HarnessPortListeners -Ports @($ServerPort, 11433, 11434, 11435))
         if ($busy.Count -gt 0) {
             Write-Warning ("Teardown incomplete - ports still busy: " + ($busy -join ", ") + ". Inspect with: Get-NetTCPConnection -LocalPort " + ($busy -join ","))
         } else {
