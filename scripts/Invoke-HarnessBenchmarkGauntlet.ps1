@@ -47,6 +47,12 @@ param(
     [int]$ServerWaitSeconds = 180,
     [string]$HybridBaseUrl = "http://127.0.0.1:13305/api/v1",
     [string]$HybridModel = "Qwen2.5-3B-Instruct-Hybrid",
+    # True NPU-only row is served by Lemonade too (no in-process NPU engine
+    # exists). 1.5B is the smallest supported NPU checkpoint in the catalog.
+    [string]$NpuModel = "Qwen-2.5-1.5B-Instruct-NPU",
+    # Research: RyzenAI 1.6+ requires NPU driver >= 32.0.203.280
+    # (https://lemonade-server.ai/driver_install.html)
+    [version]$MinNpuDriver = "32.0.203.280",
     [switch]$SkipPreflight,
     [switch]$SkipHybridCheck,
     [switch]$NoAutoFix,
@@ -169,34 +175,78 @@ if (-not $SkipPreflight.IsPresent) {
             return $null
         }
 
-        Write-Step "Preflight: Lemonade hybrid model catalog"
+        Write-Step "Preflight: NPU driver version"
+        $npuDriver = $null
+        try {
+            $npuDevice = Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
+                Where-Object { $_.DeviceName -like "*NPU*" -or $_.DeviceName -like "*IPU*" } |
+                Select-Object -First 1
+            if ($npuDevice) { $npuDriver = [version]$npuDevice.DriverVersion }
+        } catch { }
+        if ($null -eq $npuDriver) {
+            $warning = "NPU driver not detected via Win32_PnPSignedDriver. If NPU/hybrid rows fail to load, install the driver: https://lemonade-server.ai/driver_install.html"
+            $preflightWarnings += $warning
+            Write-Warning $warning
+        } elseif ($npuDriver -lt $MinNpuDriver) {
+            $warning = ("NPU driver " + $npuDriver + " is below the RyzenAI minimum " + $MinNpuDriver + ". NPU/hybrid model loads will likely fail (RyzenAI-Server). Fix: AMD auto-detect at https://www.amd.com/en/support/download/drivers.html or manual NPU_RAI1.6_304_WHQL.zip per https://lemonade-server.ai/driver_install.html (run npu_sw_installer.exe as admin, then reboot). Driver installs need admin+reboot, so this cannot be auto-fixed.")
+            $preflightWarnings += $warning
+            Write-Warning $warning
+        } else {
+            Write-Step ("Preflight: NPU driver " + $npuDriver + " >= " + $MinNpuDriver)
+        }
+
+        Write-Step "Preflight: Lemonade model catalog"
         $ids = Get-LemonadeCatalogIds
         if ($null -eq $ids) {
-            throw ("Lemonade unreachable at " + $HybridBaseUrl + ". Start Lemonade Server (auto-starting it is intentionally out of scope), or pass -SkipHybridCheck to proceed without the hybrid row.")
+            throw ("Lemonade unreachable at " + $HybridBaseUrl + ". Start Lemonade Server (auto-starting it is intentionally out of scope), or pass -SkipHybridCheck to proceed without the hybrid/npu rows.")
         }
-        if ($ids -notcontains $HybridModel) {
-            $pullHint = "lemonade-server pull " + $HybridModel
-            if ($NoAutoFix.IsPresent) {
-                throw ("Hybrid model '" + $HybridModel + "' not in Lemonade catalog. Available: " + ($ids -join ", ") + ". Fix: " + $pullHint)
-            }
-            if ($DryRun.IsPresent) {
-                Write-Plan ("AUTO-FIX would run: " + $pullHint + " (model weights download; can take several minutes)")
+        foreach ($lemonadeModel in @($HybridModel, $NpuModel)) {
+            if ($ids -notcontains $lemonadeModel) {
+                $pullHint = "lemonade-server pull " + $lemonadeModel
+                if ($NoAutoFix.IsPresent) {
+                    throw ("Model '" + $lemonadeModel + "' not in Lemonade catalog. Available: " + ($ids -join ", ") + ". Fix: " + $pullHint)
+                }
+                if ($DryRun.IsPresent) {
+                    Write-Plan ("AUTO-FIX would run: " + $pullHint + " (model weights download; can take several minutes)")
+                } else {
+                    $cli = Resolve-LemonadeCli
+                    if (-not $cli) {
+                        throw ("Model '" + $lemonadeModel + "' missing and lemonade-server CLI not found on PATH. Run manually: " + $pullHint)
+                    }
+                    Write-Step ("AUTO-FIX: pulling " + $lemonadeModel + " via " + $cli + " (downloads weights; be patient)")
+                    & $cli pull $lemonadeModel 2>&1 | ForEach-Object { Write-Host ("[lemonade] " + $_) }
+                    if ($LASTEXITCODE -ne 0) { throw ("lemonade-server pull failed (exit " + $LASTEXITCODE + "). Check Lemonade logs; see docs/fix-plan-2026-07-02.md Phase B.1 escalation paths.") }
+                    $ids = Get-LemonadeCatalogIds
+                    if ($null -eq $ids -or $ids -notcontains $lemonadeModel) {
+                        throw ("Pull completed but '" + $lemonadeModel + "' still absent from the catalog. Escalate per Phase B.1 (DLL/driver signatures).")
+                    }
+                    Write-Step ("AUTO-FIX verified: " + $lemonadeModel + " now in catalog")
+                }
             } else {
-                $cli = Resolve-LemonadeCli
-                if (-not $cli) {
-                    throw ("Hybrid model missing and lemonade-server CLI not found on PATH. Run manually: " + $pullHint)
-                }
-                Write-Step ("AUTO-FIX: pulling hybrid model via " + $cli + " (this downloads weights; be patient)")
-                & $cli pull $HybridModel 2>&1 | ForEach-Object { Write-Host ("[lemonade] " + $_) }
-                if ($LASTEXITCODE -ne 0) { throw ("lemonade-server pull failed (exit " + $LASTEXITCODE + "). Check Lemonade logs; see docs/fix-plan-2026-07-02.md Phase B.1 escalation paths.") }
-                $ids = Get-LemonadeCatalogIds
-                if ($null -eq $ids -or $ids -notcontains $HybridModel) {
-                    throw ("Pull completed but '" + $HybridModel + "' still absent from the catalog. Escalate per Phase B.1 (DLL/driver signatures).")
-                }
-                Write-Step "AUTO-FIX verified: hybrid model now in catalog"
+                Write-Step ("Preflight: model present (" + $lemonadeModel + ")")
             }
-        } else {
-            Write-Step ("Preflight: hybrid model present (" + $HybridModel + ")")
+        }
+
+        # Load-check: catalog presence proved insufficient (RyzenAI-Server can
+        # still fail to START for a cataloged model - observed 20/20). A tiny
+        # completion per model surfaces that failure NOW with the runbook,
+        # instead of as silent fallback rows later. Warning, not fatal:
+        # failover keeps the benchmark alive either way.
+        if (-not $DryRun.IsPresent) {
+            foreach ($lemonadeModel in @($HybridModel, $NpuModel)) {
+                Write-Step ("Preflight: load-check " + $lemonadeModel + " (first NPU load can take minutes)")
+                try {
+                    $probeBody = @{ model = $lemonadeModel; messages = @(@{ role = "user"; content = "ping" }); max_tokens = 4; temperature = 0 } | ConvertTo-Json -Depth 6
+                    $null = Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 600 `
+                        -Uri ($HybridBaseUrl.TrimEnd("/") + "/chat/completions") `
+                        -ContentType "application/json" -Body $probeBody -ErrorAction Stop
+                    Write-Step ("Preflight: " + $lemonadeModel + " loads and generates")
+                } catch {
+                    $warning = ($lemonadeModel + " failed to load: " + $_.Exception.Message + " | Runbook: 1. NPU driver >= " + $MinNpuDriver + " - https://lemonade-server.ai/driver_install.html, npu_sw_installer.exe as admin + reboot; 2. reinstall latest Lemonade Server - fixes missing onnxruntime_providers_ryzenai.dll, issue #1072; 3. check %LOCALAPPDATA% Lemonade logs. Benchmark will proceed - these rows will fail over.")
+                    $preflightWarnings += $warning
+                    Write-Warning $warning
+                }
+            }
         }
     }
 }
@@ -204,7 +254,7 @@ if (-not $SkipPreflight.IsPresent) {
 # ---------------- Dry run: print the plan and exit ----------------
 if ($DryRun.IsPresent) {
     Write-Plan "Stop-HarnessBackend / Stop-HarnessModelBackendFleet  # clean slate: reused processes run stale code"
-    Write-Plan "Start-HarnessModelBackendFleet -Devices @('npu','cpu') -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LocalOnly"
+    Write-Plan "Start-HarnessModelBackendFleet -Devices @('cpu') -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LocalOnly  # npu row is Lemonade-served now"
     Write-Plan "Start-HarnessOwnLLMBackend -ModelBackendPort 11434 -Device gpu -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LlamaCppGpuLayers $GpuLayers -LocalOnly"
     Write-Plan "Get-HarnessModelBackendFleetStatus  # require reachable = 3"
     Write-Plan "Start-HarnessBackend -ExecutionMode local -Config $Config -WaitSeconds $ServerWaitSeconds"
@@ -238,17 +288,17 @@ try {
     Write-Step "Clean slate verified: all harness ports free"
     Start-Sleep -Seconds 1
 
-    Write-Step "Starting model backends (npu, cpu)"
-    $null = Start-HarnessModelBackendFleet -Devices @("npu", "cpu") -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LocalOnly
+    Write-Step "Starting model backends (cpu; npu row is Lemonade-served)"
+    $null = Start-HarnessModelBackendFleet -Devices @("cpu") -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LocalOnly
     Write-Step "Starting GPU backend (n_gpu_layers=$GpuLayers)"
     $null = Start-HarnessOwnLLMBackend -ModelBackendPort 11434 -Device gpu -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LlamaCppGpuLayers $GpuLayers -LocalOnly
     $modelBackendsStarted = $true
 
-    $fleet = Get-HarnessModelBackendFleetStatus
-    if ([int]$fleet.reachable -lt 3) {
-        throw ("Model backend fleet not ready: reachable=" + $fleet.reachable + "/3")
+    $fleet = Get-HarnessModelBackendFleetStatus -Devices @("gpu", "cpu")
+    if ([int]$fleet.reachable -lt 2) {
+        throw ("Model backend fleet not ready: reachable=" + $fleet.reachable + "/2 (gpu, cpu)")
     }
-    Write-Step "Fleet ready (3/3)"
+    Write-Step "Fleet ready (2/2 local: gpu, cpu; npu+hybrid via Lemonade)"
 
     Write-Step ("Starting harnessd (config=" + $Config + ", wait<=" + $ServerWaitSeconds + "s)")
     $null = Start-HarnessBackend -ExecutionMode local -Config $Config -WaitSeconds $ServerWaitSeconds
