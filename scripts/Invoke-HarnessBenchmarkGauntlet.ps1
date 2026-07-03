@@ -180,10 +180,12 @@ if (-not $SkipPreflight.IsPresent) {
 
 # ---------------- Dry run: print the plan and exit ----------------
 if ($DryRun.IsPresent) {
+    Write-Plan "Stop-HarnessBackend / Stop-HarnessModelBackendFleet  # clean slate: reused processes run stale code"
     Write-Plan "Start-HarnessModelBackendFleet -Devices @('npu','cpu') -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LocalOnly"
     Write-Plan "Start-HarnessOwnLLMBackend -ModelBackendPort 11434 -Device gpu -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LlamaCppGpuLayers $GpuLayers -LocalOnly"
     Write-Plan "Get-HarnessModelBackendFleetStatus  # require reachable = 3"
     Write-Plan "Start-HarnessBackend -ExecutionMode local -Config $Config -WaitSeconds $ServerWaitSeconds"
+    Write-Plan "canary request  # asserts execution.generation_ms exists (fails hard on stale harnessd)"
     for ($i = 1; $i -le $Runs; $i++) {
         $runDir = Join-Path $OutputRoot ("run-{0:d2}" -f $i)
         Write-Plan (".\scripts\Benchmark-MultiDeviceHarness.ps1 -Seed $Seed -MaxTokens $MaxTokens -WriteCsv -OutputDir $runDir -ServerHost $ServerHost -ServerPort $ServerPort")
@@ -201,6 +203,15 @@ $modelBackendsStarted = $false
 $serverStarted = $false
 $runDirs = @()
 try {
+    # Clean slate: the start cmdlets are session-aware and will happily reuse
+    # already-running processes - which then execute whatever code they were
+    # started with. The 2026-07-02 20:40 gauntlet benchmarked pre-fix
+    # processes from 18:34 this way. Always restart for code freshness.
+    Write-Step "Clean slate: stopping any existing harness processes"
+    try { $null = Stop-HarnessBackend -ExecutionMode local -Config $Config } catch { }
+    try { $null = Stop-HarnessModelBackendFleet -Devices @("npu", "gpu", "cpu") } catch { }
+    Start-Sleep -Seconds 2
+
     Write-Step "Starting model backends (npu, cpu)"
     $null = Start-HarnessModelBackendFleet -Devices @("npu", "cpu") -Model $Model -Backend auto -ModelsRoot $ModelsRoot -LocalOnly
     Write-Step "Starting GPU backend (n_gpu_layers=$GpuLayers)"
@@ -216,6 +227,25 @@ try {
     Write-Step ("Starting harnessd (config=" + $Config + ", wait<=" + $ServerWaitSeconds + "s)")
     $null = Start-HarnessBackend -ExecutionMode local -Config $Config -WaitSeconds $ServerWaitSeconds
     $serverStarted = $true
+
+    Write-Step "Canary: verifying the running code is current"
+    $canaryBody = @{
+        messages = @(@{ role = "user"; content = "canary" })
+        route = "direct"
+        max_tokens = 64
+        temperature = 0.0
+        seed = 1
+    } | ConvertTo-Json -Depth 6
+    $canaryRaw = Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 300 `
+        -Uri ("http://" + $ServerHost + ":" + $ServerPort + "/v1/chat/completions") `
+        -ContentType "application/json" -Body $canaryBody
+    $canary = $canaryRaw.Content | ConvertFrom-Json
+    $execution = $null
+    if ($canary.PSObject.Properties.Name -contains "execution") { $execution = $canary.execution }
+    if ($null -eq $execution -or -not ($execution.PSObject.Properties.Name -contains "generation_ms")) {
+        throw "Stale harness detected: canary response lacks execution.generation_ms (a current-code field). A pre-existing harnessd/backend survived the clean-slate stop; kill lingering python processes and re-run."
+    }
+    Write-Step "Canary passed: current code confirmed"
 
     New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
     for ($i = 1; $i -le $Runs; $i++) {
