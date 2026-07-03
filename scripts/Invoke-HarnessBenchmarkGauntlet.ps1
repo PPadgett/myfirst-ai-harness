@@ -176,23 +176,30 @@ if (-not $SkipPreflight.IsPresent) {
         }
 
         Write-Step "Preflight: NPU driver version"
+        # Match the AMD NPU driver family (32.x). Generic *NPU*/*IPU* device
+        # matching previously grabbed a Windows-inbox component and reported
+        # 10.0.26100.x - a false alarm while the real NPU worked fine. The
+        # load-checks below are ground truth; driver version is context.
         $npuDriver = $null
+        $npuCandidates = @()
         try {
-            $npuDevice = Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
-                Where-Object { $_.DeviceName -like "*NPU*" -or $_.DeviceName -like "*IPU*" } |
-                Select-Object -First 1
-            if ($npuDevice) { $npuDriver = [version]$npuDevice.DriverVersion }
+            $npuCandidates = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue |
+                Where-Object { $_.DeviceName -like "*NPU*" -or $_.DeviceName -like "*IPU*" })
+            $amd = @($npuCandidates | Where-Object { ([string]$_.DriverVersion).StartsWith("32.") } |
+                Sort-Object { [version]$_.DriverVersion } -Descending)
+            if ($amd.Count -gt 0) { $npuDriver = [version]$amd[0].DriverVersion }
         } catch { }
-        if ($null -eq $npuDriver) {
-            $warning = "NPU driver not detected via Win32_PnPSignedDriver. If NPU/hybrid rows fail to load, install the driver: https://lemonade-server.ai/driver_install.html"
-            $preflightWarnings += $warning
-            Write-Warning $warning
-        } elseif ($npuDriver -lt $MinNpuDriver) {
-            $warning = ("NPU driver " + $npuDriver + " is below the RyzenAI minimum " + $MinNpuDriver + ". NPU/hybrid model loads will likely fail (RyzenAI-Server). Fix: AMD auto-detect at https://www.amd.com/en/support/download/drivers.html or manual NPU_RAI1.6_304_WHQL.zip per https://lemonade-server.ai/driver_install.html (run npu_sw_installer.exe as admin, then reboot). Driver installs need admin+reboot, so this cannot be auto-fixed.")
-            $preflightWarnings += $warning
-            Write-Warning $warning
+        if ($null -ne $npuDriver) {
+            if ($npuDriver -ge $MinNpuDriver) {
+                Write-Step ("Preflight: AMD NPU driver " + $npuDriver + " >= " + $MinNpuDriver)
+            } else {
+                $warning = ("AMD NPU driver " + $npuDriver + " is below the RyzenAI minimum " + $MinNpuDriver + ". Fix - AMD auto-detect: https://www.amd.com/en/support/download/drivers.html or manual NPU_RAI1.6_304_WHQL.zip per https://lemonade-server.ai/driver_install.html - npu_sw_installer.exe as admin, then reboot. Driver installs need admin+reboot and cannot be auto-fixed.")
+                $preflightWarnings += $warning
+                Write-Warning $warning
+            }
         } else {
-            Write-Step ("Preflight: NPU driver " + $npuDriver + " >= " + $MinNpuDriver)
+            $names = ($npuCandidates | ForEach-Object { [string]$_.DeviceName + "@" + [string]$_.DriverVersion }) -join "; "
+            Write-Step ("Preflight: AMD 32.x NPU driver not identified via WMI - relying on load-checks. Candidates: " + $names)
         }
 
         Write-Step "Preflight: Lemonade model catalog"
@@ -227,25 +234,77 @@ if (-not $SkipPreflight.IsPresent) {
             }
         }
 
+        function Test-LemonadeModelLoad {
+            param([string]$ModelId)
+            try {
+                $probeBody = @{ model = $ModelId; messages = @(@{ role = "user"; content = "ping" }); max_tokens = 4; temperature = 0 } | ConvertTo-Json -Depth 6
+                $null = Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 600 `
+                    -Uri ($HybridBaseUrl.TrimEnd("/") + "/chat/completions") `
+                    -ContentType "application/json" -Body $probeBody -ErrorAction Stop
+                return $true
+            } catch { return $false }
+        }
+
+        function Repair-LemonadeHybridDlls {
+            # Known Lemonade 9.3.x packaging defect - github.com/lemonade-sdk/lemonade
+            # issue #1072: the installer omits onnxruntime_providers_ryzenai.dll,
+            # so HYBRID loads fail while NPU-only works - exactly the observed
+            # signature. Documented repair per lemonade-sdk/ryzenai-server: copy
+            # the RyzenAI SW deployment DLLs into the engine directory.
+            $missingDll = "onnxruntime_providers_ryzenai.dll"
+            $deployments = @(Get-ChildItem "C:\Program Files\RyzenAI\*\deployment" -Directory -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending)
+            if ($deployments.Count -eq 0) { return "no_ryzenai_sw" }
+            $roots = @()
+            $cli = Resolve-LemonadeCli
+            if ($cli) { $roots += (Split-Path -Parent $cli) }
+            $roots += (Join-Path $env:LOCALAPPDATA "lemonade_server")
+            $roots += (Join-Path $env:LOCALAPPDATA "Programs\lemonade-server")
+            $targets = @()
+            foreach ($root in ($roots | Select-Object -Unique)) {
+                if (-not (Test-Path -LiteralPath $root)) { continue }
+                $targets += @(Get-ChildItem -Path $root -Recurse -Filter "onnxruntime*.dll" -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty DirectoryName -Unique)
+            }
+            $targets = @($targets | Select-Object -Unique)
+            if ($targets.Count -eq 0) { return "no_lemonade_engine_dir" }
+            $repaired = 0
+            foreach ($dir in $targets) {
+                if (Test-Path -LiteralPath (Join-Path $dir $missingDll)) { continue }
+                Write-Step ("AUTO-FIX: copying RyzenAI deployment DLLs from " + $deployments[0].FullName + " to " + $dir)
+                Copy-Item -Path (Join-Path $deployments[0].FullName "*") -Destination $dir -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath (Join-Path $dir $missingDll)) { $repaired++ }
+            }
+            if ($repaired -gt 0) { return ("repaired_" + $repaired) }
+            return "dll_already_present"
+        }
+
         # Load-check: catalog presence proved insufficient (RyzenAI-Server can
-        # still fail to START for a cataloged model - observed 20/20). A tiny
-        # completion per model surfaces that failure NOW with the runbook,
-        # instead of as silent fallback rows later. Warning, not fatal:
-        # failover keeps the benchmark alive either way.
+        # still fail to START for a cataloged model - observed 20/20). On
+        # hybrid failure, attempt the documented DLL repair, then retry once.
+        # Warning, not fatal: failover keeps the benchmark alive either way.
         if (-not $DryRun.IsPresent) {
             foreach ($lemonadeModel in @($HybridModel, $NpuModel)) {
                 Write-Step ("Preflight: load-check " + $lemonadeModel + " (first NPU load can take minutes)")
-                try {
-                    $probeBody = @{ model = $lemonadeModel; messages = @(@{ role = "user"; content = "ping" }); max_tokens = 4; temperature = 0 } | ConvertTo-Json -Depth 6
-                    $null = Invoke-WebRequest -UseBasicParsing -Method Post -TimeoutSec 600 `
-                        -Uri ($HybridBaseUrl.TrimEnd("/") + "/chat/completions") `
-                        -ContentType "application/json" -Body $probeBody -ErrorAction Stop
+                if (Test-LemonadeModelLoad -ModelId $lemonadeModel) {
                     Write-Step ("Preflight: " + $lemonadeModel + " loads and generates")
-                } catch {
-                    $warning = ($lemonadeModel + " failed to load: " + $_.Exception.Message + " | Runbook: 1. NPU driver >= " + $MinNpuDriver + " - https://lemonade-server.ai/driver_install.html, npu_sw_installer.exe as admin + reboot; 2. reinstall latest Lemonade Server - fixes missing onnxruntime_providers_ryzenai.dll, issue #1072; 3. check %LOCALAPPDATA% Lemonade logs. Benchmark will proceed - these rows will fail over.")
-                    $preflightWarnings += $warning
-                    Write-Warning $warning
+                    continue
                 }
+                $repairResult = "skipped"
+                if (-not $NoAutoFix.IsPresent -and $lemonadeModel -eq $HybridModel) {
+                    Write-Step "AUTO-FIX: attempting Lemonade hybrid DLL repair (issue #1072 signature)"
+                    $repairResult = Repair-LemonadeHybridDlls
+                    Write-Step ("AUTO-FIX result: " + $repairResult)
+                    if ($repairResult -like "repaired*") {
+                        if (Test-LemonadeModelLoad -ModelId $lemonadeModel) {
+                            Write-Step ("AUTO-FIX verified: " + $lemonadeModel + " now loads and generates")
+                            continue
+                        }
+                    }
+                }
+                $warning = ($lemonadeModel + " failed to load (dll repair: " + $repairResult + "). Runbook: 1. upgrade Lemonade Server to the latest release - github.com/lemonade-sdk/lemonade/releases - the 9.3.1 installer shipped without " + "onnxruntime_providers_ryzenai.dll" + ", issue #1072; 2. verify AMD NPU driver >= " + $MinNpuDriver + " - https://lemonade-server.ai/driver_install.html; 3. check Lemonade logs under %LOCALAPPDATA%. Benchmark proceeds - these rows fail over.")
+                $preflightWarnings += $warning
+                Write-Warning $warning
             }
         }
     }
