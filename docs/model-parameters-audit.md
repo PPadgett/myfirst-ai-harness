@@ -99,7 +99,7 @@ Provider constructor default `max_new_tokens=256` (line 306) — yet another lay
 ## 7. Issues identified
 
 1. **No seeds → nothing is reproducible.** Any A/B between devices is one sample from four different distributions.
-2. **The "NPU" backend never ran on the NPU.** `local_model_provider` has no NPU/ONNX/Ryzen path; `--device npu` maps to torch `cuda:0` (or fails toward CPU). Your `temp.md` shows NPU at 15.14 tok/s ≈ CPU's 16.64 — CPU-class throughput. The only true NPU execution in the repo is the Lemonade **hybrid** backend.
+2. **The "NPU" backend never ran on the NPU.** `local_model_provider` has no NPU/ONNX/Ryzen path; `--device npu` maps to torch `cuda:0` (or fails toward CPU). The historical baseline in `multi-device-benchmark-baseline-2026-07-02.md` shows NPU at 15.14 tok/s ≈ CPU's 16.64 — CPU-class throughput. The only true NPU execution in the repo is the Lemonade **hybrid** backend.
 3. **Prompt templates differ per device.** transformers path (and llama.cpp fallback) flatten messages into a raw string — no ChatML. That reliably degrades instruct-tuned Qwen: your CPU row's refusal ("I'm sorry, but I can't assist") and GPU row's degenerate list ("Dreamcast 2000/2001/2002...") are classic template-mismatch artifacts. The **hybrid (Lemonade) row is the only one with a proper server-side template — and the only coherent answer.** You weren't comparing processors; you were comparing prompt formats.
 4. **Sampler config is split across 4 layers** (script → route policy → adapter → engine defaults), and the engine layer differs per device. top_p/top_k on one device come from an Ollama Modelfile, on another from generation_config.json, on another from llama-cpp-python defaults.
 5. **Omitting `-Temperature` changes the experiment**: route classification silently picks 0.0–0.3.
@@ -114,4 +114,4 @@ Provider constructor default `max_new_tokens=256` (line 306) — yet another lay
 2. Use `tokenizer.apply_chat_template` in the transformers path; fix llama.cpp fallback stop tokens; assert template parity across devices before benchmarking.
 3. Rename/gate the "npu" local_provider backend until a real NPU engine exists (or route NPU-only through Lemonade too); verify with `requested_device` vs `actual_device` in provider traces — the fields already exist.
 4. Benchmarks: always pass temperature/max_tokens/seed explicitly; equalize max_context; take N≥5 samples per cell; record `fallback_active`, `finish_reason`, `truncated` per row.
-5. Treat `temp.md` results as invalid except the Hybrid row's qualitative sanity.
+5. Treat `multi-device-benchmark-baseline-2026-07-02.md` results as invalid except the Hybrid row's qualitative sanity.
