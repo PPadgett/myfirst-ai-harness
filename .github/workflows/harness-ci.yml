@@ -14,7 +14,7 @@ concurrency:
 jobs:
   unit:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -35,7 +35,7 @@ jobs:
       - name: Static compile
         run: python -m compileall -q harness real_ai_harness.py
       - name: Run unit tests
-        run: pytest -q tests/unit
+        run: pytest -vv --timeout=90 tests/unit
 
   integration:
     runs-on: ubuntu-latest
