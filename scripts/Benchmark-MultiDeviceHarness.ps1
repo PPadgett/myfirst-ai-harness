@@ -846,4 +846,3 @@ $final | ConvertTo-Json -Depth 20 | Write-Output
 if ($FailOnBenchmarkAssertion.IsPresent -and $assertionsFailed) {
     throw "Benchmark assertion failed: error rate > 5%."
 }
-
