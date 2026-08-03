@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+guard_script="$repo_root/scripts/Assert-GitPushSize.ps1"
+
+if [ ! -f "$guard_script" ]; then
+  echo "[pre-push] Missing size guard script: $guard_script"
+  exit 1
+fi
+
+if command -v pwsh >/dev/null 2>&1; then
+  pwsh_cmd="pwsh"
+elif command -v pwsh.exe >/dev/null 2>&1; then
+  pwsh_cmd="pwsh.exe"
+elif command -v powershell >/dev/null 2>&1; then
+  pwsh_cmd="powershell"
+elif command -v powershell.exe >/dev/null 2>&1; then
+  pwsh_cmd="powershell.exe"
+elif [ -x "/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" ]; then
+  pwsh_cmd="/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+else
+  echo "[pre-push] PowerShell is required but was not found in PATH."
+  exit 1
+fi
+
+guard_script_arg="$guard_script"
+if command -v cygpath >/dev/null 2>&1; then
+  guard_script_arg="$(cygpath -w "$guard_script")"
+elif [[ "$guard_script_arg" == /mnt/* ]]; then
+  drive_letter="${guard_script_arg#/mnt/}"
+  drive_letter="${drive_letter%%/*}"
+  rest_path="${guard_script_arg#"/mnt/$drive_letter/"}"
+  drive_upper="$(printf '%s' "$drive_letter" | tr '[:lower:]' '[:upper:]')"
+  rest_windows="${rest_path//\//\\}"
+  guard_script_arg="${drive_upper}:\\${rest_windows}"
+fi
+
+mapfile -t ref_updates || true
+
+if [ "${#ref_updates[@]}" -gt 0 ]; then
+  "$pwsh_cmd" -NoProfile -ExecutionPolicy Bypass -File "$guard_script_arg" -RemoteName "${1:-origin}" -RemoteUrl "${2:-}" -RefUpdateLines "${ref_updates[@]}"
+else
+  "$pwsh_cmd" -NoProfile -ExecutionPolicy Bypass -File "$guard_script_arg" -RemoteName "${1:-origin}" -RemoteUrl "${2:-}"
+fi

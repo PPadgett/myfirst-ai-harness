@@ -128,6 +128,36 @@ python -m venv .venv
 pip install -e .
 ```
 
+## Git push size guard (pre-push hook)
+
+Use the included PowerShell guard to block pushes that contain oversized blobs or too much total new blob data.
+
+One-time setup:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Policy defaults:
+
+- Max single file in push: 50 MB
+- Max total new blob data in push: 200 MB
+
+Optional overrides:
+
+```powershell
+$env:GIT_PUSH_MAX_FILE_MB = "25"
+$env:GIT_PUSH_MAX_TOTAL_MB = "100"
+```
+
+Manual dry-run against current branch/upstream:
+
+```powershell
+pwsh -NoProfile -File .\scripts\Assert-GitPushSize.ps1
+```
+
+The hook prints a size report to standard output and exits non-zero to block the push when limits are exceeded.
+
 ## Quick local start (no container)
 
 Default backend points to an OpenAI-compatible service:
