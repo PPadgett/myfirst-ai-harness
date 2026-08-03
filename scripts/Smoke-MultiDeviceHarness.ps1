@@ -322,4 +322,3 @@ if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
 }
 
 $output | ConvertTo-Json -Depth 20 | Write-Output
-

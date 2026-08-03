@@ -23,7 +23,7 @@ param(
     [string]$ConfigBase = ".\state\benchmarks\harness-qwen25-hybrid-full.yaml",
     [string]$ConfigActive = ".\state\benchmarks\harness-qwen25-hybrid-full-active.yaml",
     [string]$Prompt = "",
-    [string]$PromptFile = "C:\Users\AllNi\.codex\attachments\b104f735-c0cd-401f-b6e5-e8146cb207e2\pasted-text.txt",
+    [string]$PromptFile = "",
     [string]$ServerHost = "127.0.0.1",
     [int]$ServerPort = 8080,
     [int]$MaxTokens = 2048,
@@ -1206,8 +1206,10 @@ $promptSource = "file"
 $promptText = if (-not [string]::IsNullOrWhiteSpace($Prompt)) {
     $promptSource = "inline"
     $Prompt
-} else {
+} elseif (-not [string]::IsNullOrWhiteSpace($PromptFile)) {
     Read-HarnessPromptText -Path $PromptFile
+} else {
+    throw "Provide prompt text with -Prompt or a readable path with -PromptFile."
 }
 if ([string]::IsNullOrWhiteSpace($promptText)) {
     throw "Prompt text is empty."

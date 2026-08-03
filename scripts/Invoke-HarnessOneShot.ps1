@@ -6197,7 +6197,7 @@ function Invoke-HarnessOneShotStack {
             model_backend_required_by_device = $modelBackendRequiredByDevice
             model_backend = $null
             one_shot = $null
-        }) 
+        })
         return _Apply-HarnessOutputOptions -InputObject $result -Property $Property -ExpandProperty $ExpandProperty -AsJson:$AsJson.IsPresent -JsonDepth $JsonDepth
     }
 
@@ -6886,6 +6886,3 @@ error_code=$backendCode. $normalized
 
     throw "Unsupported mode: $Mode"
 }
-
-
-

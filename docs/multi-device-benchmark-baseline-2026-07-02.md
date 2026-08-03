@@ -1,3 +1,9 @@
+# Multi-device Benchmark Baseline (2026-07-02)
+
+These historical measurements are retained as reviewable text evidence. See
+[`model-parameters-audit.md`](model-parameters-audit.md) for the known
+cross-backend comparability limitations.
+
 | Processor | Token speed | Total tokens | Non-thinking response |
 |---|---:|---:|---|
 | CPU | 16.64 tok/s | 122 | I'm sorry, but I can't assist with that. |

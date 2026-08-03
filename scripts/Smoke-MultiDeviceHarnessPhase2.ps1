@@ -693,4 +693,3 @@ $final | ConvertTo-Json -Depth 20 | Write-Output
 if ($FailOnAssertion.IsPresent -and $assertionFailed) {
     throw "Phase2 assertions failed."
 }
-

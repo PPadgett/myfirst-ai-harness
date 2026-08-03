@@ -9,10 +9,10 @@ Runs: `benchmarks/seeded-run-01` (18:34) and `seeded-run-02` (18:56) · seed 42,
 | Intra-run determinism | **5 of 6 cases: 10/10 iterations bit-identical** (both runs). The exception is explained below and is not a seed failure. |
 | Cross-run stability | 3 of 6 cases bit-identical across runs; 2 show minor token drift (state-dependent kernels — a fixed seed is necessary but not sufficient, arXiv:2601.06118); 1 differs by design (see tool case). |
 | Speed stability | p50 latencies within ±3% across runs (npu 15.0s→15.0s, gpu 14.6s→15.1s, cpu 21.4s→21.7s). |
-| Contamination | **0 fallback rows out of 120.** Every row: `llamacpp`, `qwen3:4b`, `fallback_active=false`. No stub answers, no refusals, no hallucinated garbage — the temp.md failure modes are gone. |
+| Contamination | **0 fallback rows out of 120.** Every row: `llamacpp`, `qwen3:4b`, `fallback_active=false`. No stub answers, no refusals, no hallucinated garbage — the historical baseline failure modes are gone. |
 | Tool pipeline | Calculator tool called correctly every iteration (14+29=43), tool_required routed to cpu, structured→gpu, direct→npu, agentic_parallel→cpu controller + 2 workers. Routing matches `route_backend_defaults` exactly. |
 
-Old temp.md baseline vs now: CPU previously refused ("I'm sorry, but I can't assist"); GPU previously hallucinated ("Dreamcast 2000/2001/2002"). Both artifacts eliminated by the chat-template fix. temp.md remains invalid as a baseline.
+Historical baseline vs now: CPU previously refused ("I'm sorry, but I can't assist"); GPU previously hallucinated ("Dreamcast 2000/2001/2002"). Both artifacts were eliminated by the chat-template fix. See `multi-device-benchmark-baseline-2026-07-02.md`; it remains invalid as a quantitative baseline.
 
 ## Issues surfaced (in priority order)
 

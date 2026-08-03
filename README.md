@@ -43,7 +43,7 @@ The production runtime can drive several model backends at once — one per proc
 - `agentic_parallel` fans the prompt out to NPU/GPU/hybrid workers concurrently and synthesizes the final answer on the CPU controller (`agentic_parallel_enabled`, `agentic_parallel_max_workers`, `agentic_parallel_max_wall_clock_seconds`).
 - Responses report `meta.provider.execution`: selected backend/device, profile and its source, the ordered backend plan, and tokens/sec.
 - Model/device compatibility catalog: `compat-hybrid-test.json`.
-- Smoke and benchmark tooling: `scripts/Smoke-MultiDeviceHarness.ps1`, `scripts/Smoke-MultiDeviceHarnessPhase2.ps1`, `scripts/Benchmark-MultiDeviceHarness.ps1`, `scripts/Benchmark-FullCoverageLoadout.ps1`, `scripts/Invoke-HarnessFullPromptBenchmark.ps1`. Measured per-device baseline: `temp.md`.
+- Smoke and benchmark tooling: `scripts/Smoke-MultiDeviceHarness.ps1`, `scripts/Smoke-MultiDeviceHarnessPhase2.ps1`, `scripts/Benchmark-MultiDeviceHarness.ps1`, `scripts/Benchmark-FullCoverageLoadout.ps1`, `scripts/Invoke-HarnessFullPromptBenchmark.ps1`. Historical per-device baseline: `docs/multi-device-benchmark-baseline-2026-07-02.md`.
 
 Known gap: `fallback_chain` currently orders the backend plan only — if the selected backend fails mid-request, the runtime does not yet retry the next device automatically.
 
